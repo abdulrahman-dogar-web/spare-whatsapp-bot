@@ -3,6 +3,8 @@
 # This must be the ONLY free web service in the Render workspace
 # (750 free instance hours/month; one service running 24/7 uses 720-744h).
 # Env var SPARE_TOKEN is set in the Render dashboard (never in this file).
+# Link mode defaults to QR (the QR is shown on the control panel);
+# LINK_MODE=code is the fallback (pairing code, also shown on the panel).
 
 services:
   - type: web
@@ -13,8 +15,6 @@ services:
     startCommand: node bot.js
     healthCheckPath: /health
     envVars:
-      - key: LINK_MODE
-        value: code
       - key: WORKER_URL
         value: https://dogar-alerts.abdulrahman-dogar.workers.dev
       - key: SPARE_TOKEN

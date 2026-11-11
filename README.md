@@ -61,16 +61,25 @@ and stops — link again (pairing code below) to resume.
 
 ## Link the bot (once)
 
-- **Render (pairing-code mode):** set `LINK_MODE=code` in the Render env
-  vars. The 8-digit code appears in the Render logs. On the phone that
-  holds the spare WhatsApp (+923703832506): WhatsApp -> Settings -> Linked
+**Primary — scan the QR on the control panel** (`/panel`, "Link sending
+number" section): the bot posts its QR there automatically. On the phone
+that holds the spare WhatsApp (+923703832506): WhatsApp -> Settings ->
+Linked Devices -> Link a Device -> scan the QR. The QR refreshes itself
+while unlinked.
+
+- **Pairing-code fallback:** set `LINK_MODE=code` in the Render env vars
+  (or run `LINK_MODE=code node bot.js`). The 8-digit code appears on the
+  panel AND in the Render logs. Same phone: WhatsApp -> Settings -> Linked
   Devices -> Link a Device -> **Link with phone number instead** -> enter
   the code. (A fresh code is requested at most once a minute until linked.)
-- **QR mode:** `bash run-bot.sh` — a QR appears in Termux. Same phone:
-  WhatsApp -> Settings -> Linked Devices -> Link a Device -> scan the QR.
+- **Termux:** `bash run-bot.sh` — a QR appears in Termux (and on the
+  panel too). Same phone: WhatsApp -> Settings -> Linked Devices ->
+  Link a Device -> scan the QR.
 
 After linking, the session is saved in Cloudflare KV — the bot stays linked
-across restarts and redeploys. To unlink any time: spare WhatsApp ->
+across restarts and redeploys. If the sending number ever goes down, the
+Worker posts a "sending number down" alert to Discord and the panel shows
+a fresh QR to re-link. To unlink any time: spare WhatsApp ->
 Linked Devices -> remove it (then the bot will clear KV auth and stop).
 
 ## Test

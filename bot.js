@@ -9,9 +9,17 @@
  *
  * HOST: Render free web service (primary). Termux on the spare phone is the
  * fallback (see ../spare-call/SETUP-TERMUX.md).
- *   $ node bot.js            # QR link mode (scan from spare WhatsApp)
- *   $ LINK_MODE=code node bot.js   # pairing-code mode (8-digit code, in logs)
+ *   $ node bot.js            # QR link mode (default; QR also shown on the
+ *                           # control panel — scan from spare WhatsApp)
+ *   $ LINK_MODE=code node bot.js   # pairing-code mode (8-digit code, in logs
+ *                           # AND on the panel as a fallback)
  *   $ DRY_RUN=1 node bot.js  # poll + log only, never send, never ack
+ *
+ * LINKING (v2.1): the bot posts its link QR (PNG data URL) and any pairing
+ * code to the Worker (/spare-link) so the control panel shows them — the
+ * user scans the QR on the panel, no log-diving needed. It also posts a
+ * status heartbeat (/spare-status) every 60s and on every change, so the
+ * Worker can tell the user on Discord if the sending number goes down.
  *
  * Env:
  *   WORKER_URL    default https://dogar-alerts.abdulrahman-dogar.workers.dev
@@ -48,6 +56,7 @@ const {
   Browsers,
 } = require("@whiskeysockets/baileys");
 const qrcode = require("qrcode-terminal");
+const QRCode = require("qrcode"); // PNG data URLs for the panel's QR section
 const pino = require("pino");
 const http = require("http");
 const fs = require("fs");
@@ -271,6 +280,51 @@ async function ackItems(ids) {
   return data;
 }
 
+// ---- Panel link + status reporting (v2.1) ----
+// The control panel shows the link QR / pairing code and the live status,
+// so the user never has to dig through Render logs. Best-effort: a failed
+// post is logged and never crashes the bot or blocks alerts.
+async function postLink(link) {
+  try {
+    const res = await fetch(`${WORKER_URL}/spare-link`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: SPARE_TOKEN, qrDataUrl: link.qrDataUrl || null, code: link.code || null }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) log("spare-link post failed: HTTP " + res.status);
+  } catch (e) {
+    log("spare-link post failed: " + String((e && e.message) || e).slice(0, 100));
+  }
+}
+
+async function postStatus(status, ownNumber) {
+  try {
+    const res = await fetch(`${WORKER_URL}/spare-status`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: SPARE_TOKEN, status, ownNumber: ownNumber || null }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) log("spare-status post failed: HTTP " + res.status);
+  } catch (e) {
+    log("spare-status post failed: " + String((e && e.message) || e).slice(0, 100));
+  }
+}
+
+// Own number as plain digits (Baileys id looks like "923703832506:12@s.whatsapp.net").
+function ownNumberDigits(sock) {
+  try {
+    const id = sock && sock.user ? String(sock.user.id || "") : "";
+    const m = id.match(/^(\d{10,15})/);
+    return m ? m[1] : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function main() {
   if (!SPARE_TOKEN) {
     console.error("ERROR: SPARE_TOKEN env is required (the SPARE_BOT_TOKEN Worker secret).");
@@ -315,6 +369,9 @@ async function main() {
   let pairingCodeShownAt = 0;
   let sentToday = readCount();
   let reconnectAttempts = 0;
+  // Panel link/status state (v2.1): last QR + code posted, last status posted.
+  let lastLink = { qrDataUrl: null, code: null };
+  let currentStatus = "connecting";
 
   // /health server — Render requires the service to bind $PORT, and the
   // Worker's cron keep-alive pings this endpoint every 5 minutes.
@@ -343,19 +400,30 @@ async function main() {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
+        // Post the QR to the panel in BOTH modes (the panel QR is the
+        // primary link method; the pairing code is the fallback display).
+        try {
+          const dataUrl = await QRCode.toDataURL(qr, { width: 512, margin: 1 });
+          lastLink = { qrDataUrl: dataUrl, code: lastLink.code || null };
+          await postLink(lastLink);
+        } catch (e) {
+          log("QR render/post failed: " + String((e && e.message) || e).slice(0, 100));
+        }
         if (LINK_MODE === "code") {
           // Pairing code mode: request a fresh 8-digit code (max once a minute).
           if (!sock.authState.creds.registered && Date.now() - pairingCodeShownAt > 60000) {
             try {
               pairingCodeShownAt = Date.now();
               const code = await sock.requestPairingCode(SPARE_PHONE);
+              lastLink = { qrDataUrl: lastLink.qrDataUrl, code };
+              await postLink(lastLink);
               log("PAIRING CODE (enter in spare WhatsApp > Settings > Linked Devices > Link a Device > Link with phone number instead): " + code);
             } catch (e) {
               log("pairing code request failed: " + String((e && e.message) || e).slice(0, 120));
             }
           }
         } else {
-          log("QR LINK — scan with the SPARE WhatsApp (+923703832506): Settings > Linked Devices > Link a Device");
+          log("QR LINK — scan with the SPARE WhatsApp (+923703832506): Settings > Linked Devices > Link a Device (or scan the QR on the control panel)");
           qrcode.generate(qr, { small: true });
         }
       }
@@ -363,7 +431,12 @@ async function main() {
       if (connection === "open") {
         connected = true;
         reconnectAttempts = 0;
+        currentStatus = "linked";
         log("WhatsApp connected as " + (sock.user ? sock.user.id : "?"));
+        await postStatus("linked", ownNumberDigits(sock));
+        // Linked now: the panel no longer needs the QR/code.
+        lastLink = { qrDataUrl: null, code: null };
+        await postLink(lastLink);
         saveCreds(); // persist the fresh session right away
       }
       if (connection === "close") {
@@ -381,10 +454,14 @@ async function main() {
           lastDisconnect.error.output &&
           lastDisconnect.error.output.statusCode === DisconnectReason.loggedOut;
         if (loggedOut) {
+          currentStatus = "logged_out";
           log("LOGGED OUT — clearing KV auth and stopping (link again to resume).");
+          await postStatus("logged_out", ownNumberDigits(sock));
           await clearKvAuth();
           process.exit(3);
         }
+        currentStatus = "disconnected";
+        await postStatus("disconnected", ownNumberDigits(sock));
         // Exponential backoff (5s -> 10s -> 20s -> 40s -> 60s max): a dead
         // socket must not hammer WhatsApp with constant reconnects.
         reconnectAttempts++;
@@ -469,6 +546,13 @@ async function main() {
     }
   }, POLL_MS);
 
+  // Status heartbeat (v2.1): every 60s so the Worker knows the bot is
+  // alive — if it goes quiet for 10+ minutes after having linked once,
+  // the Worker posts a "sending number down" alert to Discord.
+  setInterval(() => {
+    postStatus(currentStatus, ownNumberDigits(sock)).catch(() => {});
+  }, 60 * 1000);
+
   // Keep the process alive and log a heartbeat hourly.
   setInterval(() => {
     log(`heartbeat: connected=${connected} sent_today=${sentToday} dry_run=${DRY_RUN}`);
@@ -482,4 +566,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { stripLinks, assertQueuedJid, toStorable, fromStorable, readCount, isRecentlySent, markSent, MAIN_NUMBER };
+module.exports = { stripLinks, assertQueuedJid, toStorable, fromStorable, readCount, isRecentlySent, markSent, ownNumberDigits, MAIN_NUMBER };
