@@ -18,17 +18,22 @@
  * stands. A per-item dry_run flag lets the Worker verify image handling
  * without sending anything (token-authenticated; the Worker never sets
  * dry_run in production).
- * ntfy alarm (v2.11): the BOT — not the Worker — publishes the ntfy
- * phone alarm. Cloudflare Workers share a small pool of egress IPs
- * with thousands of other users, so ntfy.sh's per-IP quota (250
- * msgs/day) is exhausted by strangers and even a first-ever post gets
- * HTTP 429 (seen 2026-11-11 on the panel Test alarm button). The
- * Render bot's IP is far less crowded. The Worker attaches an ntfy
- * block {topic, enabled, title} to the FIRST recipient's item only —
- * three recipients still mean ONE alarm, not three — and the bot POSTs
- * to ntfy.sh/<topic> with Priority: 5 right after the WhatsApp send
- * succeeds (never before, never delaying it). POST /ntfy-test is the
- * panel "Test alarm" button's endpoint (same SPARE_TOKEN auth).
+ * ntfy alarm (v2.11, title-sanitized in v2.12): the BOT — not the
+ * Worker — publishes the ntfy phone alarm. Cloudflare Workers share a
+ * small pool of egress IPs with thousands of other users, so ntfy.sh's
+ * per-IP quota (250 msgs/day) is exhausted by strangers and even a
+ * first-ever post gets HTTP 429 (seen 2026-11-11 on the panel Test
+ * alarm button). The Render bot's IP is far less crowded. The Worker
+ * attaches an ntfy block {topic, enabled, title} to the FIRST
+ * recipient's item only — three recipients still mean ONE alarm, not
+ * three — and the bot POSTs to ntfy.sh/<topic> with Priority: 5 right
+ * after the WhatsApp send succeeds (never before, never delaying it).
+ * POST /ntfy-test is the panel "Test alarm" button's endpoint (same
+ * SPARE_TOKEN auth). v2.12: the title is sanitized to ASCII/Latin1
+ * before it is set as the "Title" header — the test title's em-dash
+ * and signal titles' emoji made Node's fetch throw a ByteString error
+ * on the first Test alarm press; the catch now also keeps the FULL
+ * error message (500 chars) so failures show completely.
  * A dry-run item that explicitly carries an ntfy block also posts —
  * production never attaches ntfy to dry-run items, so this is the
  * verification hook only (proves the bot's egress IP reaches ntfy.sh
@@ -206,13 +211,33 @@ function applyDelayToken(text, receivedAt, nowMs) {
   return t + "\n⚡ Delivered in " + d;
 }
 
-// ---- ntfy.sh alarm (v2.11) ----
+// ---- ntfy.sh alarm (v2.11, title-sanitized in v2.12) ----
 // The bot — not the Worker — publishes the alarm (see header). POST
 // https://ntfy.sh/<topic> with Priority: 5 (max): Android plays a
 // continuous alarm and bypasses silent/DND. Pure helper (exported for
 // the self-test). timeoutMs caps the wait (3s on the signal path so a
 // slow ntfy.sh can never eat the Worker's 5s push budget; 5s for the
 // test endpoint, where the user is waiting for the result).
+//
+// v2.12 (2026-11-11): the ntfy TITLE travels as an HTTP header
+// ("Title"), and Node's fetch (undici) rejects header values with any
+// character > 255 (ByteString) — the test title's em-dash and signal
+// titles' 🟢/🔴 emoji threw "Cannot convert argument to a ByteString..."
+// on the very first Test alarm press. sanitizeNtfyTitle() makes every
+// title ASCII/Latin1-safe right here, so the bot can never throw
+// ByteString again no matter who sends it a title (the Worker also
+// sanitizes first — defense in depth). The message BODY is untouched:
+// emoji in the body is fine, it is the POST body (UTF-8), not a header.
+// The catch now keeps the FULL error message (500 chars, was 60) so
+// the panel console shows a failure completely instead of cut off.
+function sanitizeNtfyTitle(title) {
+  return String(title || "Signal")
+    .replace(/[\u2013\u2014]/g, "-") // en-dash / em-dash -> "-"
+    .replace(/[^\x00-\xFF]/g, "") // drop anything above Latin1 (emoji etc.)
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 100) || "Signal";
+}
 function isValidNtfyTopic(topic) {
   return typeof topic === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(topic);
 }
@@ -223,13 +248,13 @@ async function sendNtfyAlarm(topic, title, text, timeoutMs) {
   try {
     const res = await fetch("https://ntfy.sh/" + encodeURIComponent(t), {
       method: "POST",
-      headers: { "Priority": "5", "Title": String(title || "Signal").slice(0, 100), "Content-Type": "text/plain; charset=utf-8" },
+      headers: { "Priority": "5", "Title": sanitizeNtfyTitle(title), "Content-Type": "text/plain; charset=utf-8" },
       body: String(text || "").slice(0, 4000),
       signal: AbortSignal.timeout(Number(timeoutMs) > 0 ? Number(timeoutMs) : 5000),
     });
     return "ntfy_http_" + res.status;
   } catch (e) {
-    return "ntfy_error_" + String((e && e.message) || e).slice(0, 60);
+    return "ntfy_error_" + String((e && e.message) || e).slice(0, 500);
   }
 }
 
@@ -1023,4 +1048,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { stripLinks, assertQueuedJid, isValidSignalItem, formatDelay, applyDelayToken, sendNtfyAlarm, isValidNtfyTopic, toStorable, fromStorable, readCount, isRecentlySent, markSent, ownNumberDigits, isValidBotCommand, fetchBotCommand, ackBotCommand, MAIN_NUMBER };
+module.exports = { stripLinks, assertQueuedJid, isValidSignalItem, formatDelay, applyDelayToken, sendNtfyAlarm, sanitizeNtfyTitle, isValidNtfyTopic, toStorable, fromStorable, readCount, isRecentlySent, markSent, ownNumberDigits, isValidBotCommand, fetchBotCommand, ackBotCommand, MAIN_NUMBER };
