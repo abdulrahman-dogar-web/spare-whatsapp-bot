@@ -1,0 +1,21 @@
+# Render Blueprint — spare WhatsApp alert bot (FREE web service)
+# Deploy: Render dashboard -> New -> Blueprint -> connect this repo.
+# This must be the ONLY free web service in the Render workspace
+# (750 free instance hours/month; one service running 24/7 uses 720-744h).
+# Env var SPARE_TOKEN is set in the Render dashboard (never in this file).
+
+services:
+  - type: web
+    name: spare-whatsapp-bot
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node bot.js
+    healthCheckPath: /health
+    envVars:
+      - key: LINK_MODE
+        value: code
+      - key: WORKER_URL
+        value: https://dogar-alerts.abdulrahman-dogar.workers.dev
+      - key: SPARE_TOKEN
+        sync: false
