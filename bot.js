@@ -145,7 +145,15 @@ const LINK_MODE = (process.env.LINK_MODE || "qr").toLowerCase();
 const DRY_RUN = process.env.DRY_RUN === "1";
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const SEND_GAP_MS = 3000;
-const DAILY_CAP = 30;
+// v2.13.3: DAILY_CAP raised 30 -> 120. The cap counts EVERY WhatsApp
+// send (all recipients), so 30 meant only 10 signals/day across 3
+// recipients — an 11th signal on a busy day would be silently held
+// ("daily cap reached") and the ring with it (ntfy fires after the
+// WhatsApp send). 120 = ~40 signals/day, far above any real volume
+// (best day so far: 7 signals), while still guarding against a runaway
+// loop. Sends stay spaced 3s apart, so the spam risk is unchanged.
+// NOTE: this only takes effect after a Manual Deploy on Render.
+const DAILY_CAP = 120;
 const COUNT_FILE = path.join(__dirname, "sent-count.json");
 const SENT_IDS_FILE = path.join(__dirname, "sent-ids.json");
 const DEDUP_WINDOW_MS = 60 * 60 * 1000; // never send the same queue id twice within 1h
@@ -904,7 +912,7 @@ async function main() {
   const server = http.createServer((req, res) => {
     if (req.url === "/health" || req.url === "/") {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, bot: "spare-whatsapp-bot", version: "2.13.2", connected, paused, state: paused ? "paused" : (connected ? "linked" : currentStatus), sent_today: sentToday, last_ntfy: lastNtfy, ntfy_server: ntfyServerStatus, ntfy_exists: fs.existsSync(path.join(__dirname, "ntfy")), ntfy_path: path.join(__dirname, "ntfy"), cwd: process.cwd(), ts: Date.now() }));
+      res.end(JSON.stringify({ ok: true, bot: "spare-whatsapp-bot", version: "2.13.3", connected, paused, state: paused ? "paused" : (connected ? "linked" : currentStatus), sent_today: sentToday, last_ntfy: lastNtfy, ntfy_server: ntfyServerStatus, ntfy_exists: fs.existsSync(path.join(__dirname, "ntfy")), ntfy_path: path.join(__dirname, "ntfy"), cwd: process.cwd(), ts: Date.now() }));
     } else if (req.url === "/signal" && req.method === "POST") {
       handlePushSignal(req, res);
     } else if (req.url === "/ntfy-test" && req.method === "POST") {
