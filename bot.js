@@ -10,6 +10,14 @@
  * fails, or a signal queued while the bot is down, still arrives on the
  * next poll. No public IP / port forwarding is needed (Render gives the
  * bot a public URL and the Worker calls it).
+ * Image (v2.10): ~17s after the text, the Worker pushes the chart
+ * screenshot (POST /signal, kind "entry-image", image {data: base64 JPEG,
+ * mime, caption}) and the bot sends it as a WhatsApp image message to
+ * the same recipients. Image pushes are best-effort only (never queued
+ * in KV) — if the bot is down or paused the image is lost, the text
+ * stands. A per-item dry_run flag lets the Worker verify image handling
+ * without sending anything (token-authenticated; the Worker never sets
+ * dry_run in production).
  *
  * HOST: Render free web service (primary). Termux on the spare phone is the
  * fallback (see ../spare-call/SETUP-TERMUX.md).
@@ -147,13 +155,18 @@ function assertQueuedJid(number) {
 // Pushed-signal shape (v2.6): the Worker POSTs the queued item itself to
 // /signal — {id, kind, text, to} plus the SPARE_TOKEN. The token is
 // checked separately (401), so this only validates the item shape.
+// v2.10: an "entry-image" item also carries image {data: base64, mime,
+// caption}; dry_run (boolean) is the verification hook — it is validated
+// here like any other field, and sendQueuedItem handles it.
 // Exported for the self-test.
 function isValidSignalItem(item) {
   return !!item && typeof item === "object" &&
     typeof item.id === "string" && item.id.length > 0 &&
     typeof item.text === "string" && item.text.length > 0 &&
     (item.to === undefined || typeof item.to === "string") &&
-    (item.kind === undefined || typeof item.kind === "string");
+    (item.kind === undefined || typeof item.kind === "string") &&
+    (item.image === undefined || (typeof item.image === "object" && typeof item.image.data === "string" && item.image.data.length > 0)) &&
+    (item.dry_run === undefined || typeof item.dry_run === "boolean");
 }
 
 // Delivery delay (v2.7): the Worker stamps each item with receivedAt —
@@ -525,7 +538,7 @@ async function main() {
     let body = "";
     req.on("data", (chunk) => {
       body += chunk;
-      if (body.length > 10000) req.destroy();
+      if (body.length > 2000000) req.destroy(); // v2.10: image pushes carry base64 JPEG (~100-300KB); token-authenticated, so 2MB is safe
     });
     req.on("end", async () => {
       let item = null;
@@ -560,7 +573,9 @@ async function main() {
         res.end(JSON.stringify({ ok: true, result: r.action, ms }));
       } else if (r.action === "dryrun") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true, result: "dryrun", ms }));
+        // v2.10: the per-item dry run reports the decoded image size, so
+        // the Worker can verify image handling without sending anything.
+        res.end(JSON.stringify({ ok: true, result: "dryrun", ms, ...(typeof r.imageBytes === "number" ? { imageBytes: r.imageBytes } : {}) }));
       } else {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true, result: "retry_" + r.reason, ms }));
@@ -765,6 +780,25 @@ async function main() {
       log(`skip duplicate ${item.id} (already sent, still listed)`);
       return { action: "drop", reason: "duplicate" };
     }
+    // Chart image (v2.10): kind "entry-image" carries image {data: base64
+    // JPEG, mime, caption}. Decoded + size-checked here so a bad image is
+    // dropped, never sent. Images are push-only (never in the KV queue).
+    let imageBuf = null;
+    if (item.image && typeof item.image === "object" && typeof item.image.data === "string") {
+      try { imageBuf = Buffer.from(item.image.data, "base64"); } catch (e) { imageBuf = null; }
+      if (!imageBuf || imageBuf.length < 2000 || imageBuf.length > 1500000) {
+        log(`refusing item ${item.id}: bad image payload (${imageBuf ? imageBuf.length : 0} bytes)`);
+        return { action: "drop", reason: "bad image" };
+      }
+    }
+    // Per-item dry run (v2.10, verification hook): validate + decode the
+    // image (or text) and log it, but send nothing and ack nothing. Only
+    // the Worker can call /signal (token-authenticated); the Worker never
+    // sets dry_run in production.
+    if (item.dry_run === true) {
+      log(`[DRY-RUN-ITEM] would send ${imageBuf ? "image (" + imageBuf.length + " bytes, " + (item.image.mime || "?") + ")" : "text"} to ${item.to || MAIN_NUMBER}: ${text.slice(0, 120)}`);
+      return { action: "dryrun", reason: "dry-run-item", imageBytes: imageBuf ? imageBuf.length : 0 };
+    }
     if (sentToday >= DAILY_CAP) {
       log(`daily cap (${DAILY_CAP}) reached — leaving rest queued`);
       return { action: "retry", reason: "daily cap reached" };
@@ -790,12 +824,17 @@ async function main() {
     const wait = SEND_GAP_MS - (Date.now() - lastSendAt);
     if (wait > 0) await sleep(wait);
     try {
-      await sock.sendMessage(jid, { text });
+      if (imageBuf) {
+        const caption = String((item.image && item.image.caption) || item.text || "").slice(0, 300);
+        await sock.sendMessage(jid, { image: imageBuf, caption });
+      } else {
+        await sock.sendMessage(jid, { text });
+      }
       lastSendAt = Date.now();
       sentToday++;
       writeCount(sentToday);
       markSent(item.id);
-      log(`sent to ${jid} (${item.kind}): ${text.slice(0, 120)}`);
+      log(`sent to ${jid} (${item.kind}): ${imageBuf ? "image (" + imageBuf.length + " bytes)" : text.slice(0, 120)}`);
       return { action: "sent", reason: "sent to " + jid };
     } catch (e) {
       log("send failed, will retry next poll: " + String((e && e.message) || e).slice(0, 120));
