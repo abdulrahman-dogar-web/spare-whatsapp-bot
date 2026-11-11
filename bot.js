@@ -156,6 +156,28 @@ function isValidSignalItem(item) {
     (item.kind === undefined || typeof item.kind === "string");
 }
 
+// Delivery delay (v2.7): the Worker stamps each item with receivedAt —
+// the moment the TradingView webhook arrived. The delay is measured at
+// send time, honestly, never faked: one decimal place, e.g. "2.4s".
+// formatDelay returns "—" when receivedAt is missing/invalid.
+// applyDelayToken replaces a literal <delay> in the message; if the
+// template has no <delay> (hard-coded fallback format), the delay line
+// is appended at the end so EVERY signal still shows how fast it was
+// delivered. If receivedAt is missing, the text is left untouched.
+function formatDelay(receivedAt, nowMs) {
+  const r = Number(receivedAt);
+  const n = Number(nowMs);
+  if (!Number.isFinite(r) || r <= 0 || !Number.isFinite(n) || n < r) return "—";
+  return ((n - r) / 1000).toFixed(1) + "s";
+}
+function applyDelayToken(text, receivedAt, nowMs) {
+  const t = String(text || "");
+  const d = formatDelay(receivedAt, nowMs);
+  if (d === "—") return t;
+  if (t.includes("<delay>")) return t.replace(/<delay>/g, d);
+  return t + "\n⚡ Delivered in " + d;
+}
+
 // ---- Baileys auth in Cloudflare KV (via the Worker /spare-auth) ----
 // Buffers do not survive a plain JSON round-trip, so convert every
 // Uint8Array/Buffer to {__b64} before storing and back on load.
@@ -734,7 +756,9 @@ async function main() {
   //   "dryrun" — logged only, never acked (DRY_RUN mode)
   let lastSendAt = 0;
   async function sendQueuedItem(item) {
-    const text = stripLinks(item.text || "");
+    // Delay line (v2.7): applied AFTER stripLinks, so the line is never
+    // cut off by the 500-char cap.
+    const text = applyDelayToken(stripLinks(item.text || ""), item.receivedAt, Date.now());
     if (!text) return { action: "drop", reason: "empty text" };
     if (isRecentlySent(item.id)) {
       // KV can briefly re-list an acked item; never send it twice.
@@ -841,4 +865,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { stripLinks, assertQueuedJid, isValidSignalItem, toStorable, fromStorable, readCount, isRecentlySent, markSent, ownNumberDigits, isValidBotCommand, fetchBotCommand, ackBotCommand, MAIN_NUMBER };
+module.exports = { stripLinks, assertQueuedJid, isValidSignalItem, formatDelay, applyDelayToken, toStorable, fromStorable, readCount, isRecentlySent, markSent, ownNumberDigits, isValidBotCommand, fetchBotCommand, ackBotCommand, MAIN_NUMBER };

@@ -25,7 +25,7 @@ the bot a public URL and the Worker calls it).
 - `render.yaml` — Render Blueprint (free web service, `/health` check)
 - `run-bot.sh` — Termux starter (reads the token from `.spare-token`)
 
-## How alerts flow (v2.6 — push, poll as fallback)
+## How alerts flow (v2.7 — push, poll as fallback)
 
 TradingView alert -> dogar-alerts Worker -> Discord (unchanged) + KV queue
 (`wa`) -> **Worker PUSHES the queued item to this bot (`POST /signal`,
@@ -41,12 +41,87 @@ identically on both paths — a pushed duplicate of an already-sent queue
 id is never sent twice. The push handler answers AFTER the send, so the
 Worker measures the true delivery time from the round trip.
 
-Measured delay (live, after the v2.6 Render deploy): _pending — fill in
-from the first TEST webhook after deploy_ (target: webhook POST to
-WhatsApp send ≤ 3s). Fallback poll at 5s costs ~2 Worker requests per
-poll cycle (queue + command check) ≈ 35k requests/day and ≈ 35k KV
-reads/day — inside the 100k/day free budget for both. Do NOT poll faster
-than 5s: the gain is under a second and the KV read budget halves.
+Measured delay (dry-run, 2026-11-11 — NO live test send was made, the
+user has stopped all test sends): webhook POST -> Worker response in
+**36ms**, Worker push round trip to the bot **27ms** (local dry-run bot,
+`DRY_RUN=1`, localhost). The real Baileys send time on the live bot is
+NOT in that number — the true end-to-end delay (webhook -> WhatsApp
+delivered) can only be measured on a live test, which needs the user's
+approval first. Target stays ≤ 3s. Fallback poll at 5s costs ~2 Worker
+requests per poll cycle (queue + command check) ≈ 35k requests/day and
+≈ 35k KV reads/day — inside the 100k/day free budget for both. Do NOT
+poll faster than 5s: the gain is under a second and the KV read budget
+halves.
+
+## Delivery delay line (v2.7)
+
+Every WhatsApp signal message ends with a line showing how fast it was
+delivered, e.g. `⚡ Delivered in 2.4s` — measured honestly from the
+moment the Worker receives the TradingView webhook (`receivedAt`, carried
+in the queued item and the pushed payload) to the moment the bot sends
+the message. One decimal place, never faked. The bot fills it in at send
+time (`formatDelay` / `applyDelayToken` in `bot.js`, unit-tested): a
+`<delay>` token in the message is replaced in place; if the message has
+no `<delay>` (the hard-coded fallback format), the line is appended at
+the end. The same delay is also shown in the Discord embed footer
+(Worker-side, after the push returns).
+
+## Message format (v2.7 — set in the panel, not in code)
+
+The control panel has a **Message Format** tab: the user writes the
+WhatsApp format himself with `<tokens>`, with a live preview (sample BUY
+signal) and Save / Reset-to-default. The Worker renders the saved
+template per signal (`parseSignalFields` + `renderMessageTemplate` in
+the Worker; unknown tokens are left as-is, a bad template never crashes
+the alert path). No saved template = the current hard-coded format.
+Discord embeds are NOT templated (only the delay footer is added).
+
+Tokens (all from fields the Worker already parses from the webhook
+embed):
+
+| Token | Meaning |
+|---|---|
+| `<signal>` | Direction with its dot: 🟢 BUY or 🔴 SELL |
+| `<flag>` | 🚩 when the signal is flagged, otherwise empty |
+| `<star>` | ⭐ when the signal is starred, otherwise empty |
+| `<sl>` | Stop-loss price |
+| `<tp>` | Take-profit price (1:1.2 target) |
+| `<entry>` | Entry price |
+| `<chart>` | TradingView XAUUSD 1m chart link |
+| `<session>` | Trading session, e.g. New York |
+| `<time>` | Signal time |
+| `<bull>` | Bull score |
+| `<bear>` | Bear score |
+| `<trend>` | Overall trend, e.g. BULLISH ▲ |
+| `<structure>` | Overall structure, e.g. BULLISH ▲ |
+| `<warning>` | The "check the authority of the signal" warning text |
+| `<delay>` | Delivery delay, e.g. 2.4s (filled in when the message is sent) |
+
+Default template (reproduces the current message exactly, plus the
+delay line at the end):
+
+```
+<signal> SIGNAL - Detected<flag><star>
+📉 SL <sl>
+📈 TP <tp>
+👑 Entry <entry>
+CLICK HERE: <chart>
+⚠️ <warning>
+> <session> > <time> > Bull <bull> / Bear <bear>
+- <trend> > <structure>
+⚡ Delivered in <delay>
+```
+
+## Durable dedup (v2.7)
+
+The bot's 1-hour dedup file (`sent-ids.json`) lives on Render's ephemeral
+disk — a restart in the window between a successful send and its KV ack
+could wipe it and re-send the item. The Worker now keeps the same
+markers durably in KV (`spare:sent-markers`, written on ack, pruned to
+1h): an acked queue id is never listed again, even after a bot restart.
+The bot's local dedup stays as the fast path; the KV markers are the
+backstop. `readPending` only reads the marker map when the queue index
+is non-empty, so empty polls cost no extra KV read.
 
 SINGLE-ALERT RULE (2026-11-11): only ONE alert per signal is ever queued —
 the entry confirmation ("🟢/🔴 BUY/SELL SIGNAL - Detected", with SL, TP,
@@ -74,7 +149,9 @@ and stops — link again (pairing code below) to resume.
 - Reconnects use exponential backoff (5s -> 60s max), never a tight loop.
 - Dedup: an alert id sent once is never sent again within 1 hour, even if
   Cloudflare KV briefly re-lists it after the ack (KV reads are eventually
-  consistent — verified live during testing).
+  consistent — verified live during testing). The Worker also keeps the
+  same markers durably in KV (`spare:sent-markers`), so a Render restart
+  can never re-send an acked item (v2.7).
 - Warm-up: after linking, send ONE test alert first, confirm it arrives,
   then let real alerts flow. Real volume is a few messages per day.
 
@@ -111,7 +188,8 @@ Linked Devices -> remove it (then the bot will clear KV auth and stop).
 
 - `npm run self-test` — unit test: link stripping, recipient guard,
   KV auth serialization round-trip, dedup, bot commands, pushed-signal
-  shape (`isValidSignalItem`).
+  shape (`isValidSignalItem`), delivery-delay helpers (`formatDelay` /
+  `applyDelayToken`).
 - `npm run dry-run` — poll the live queue and log what WOULD be sent
   (sends nothing, acks nothing). Needs `SPARE_TOKEN` in env.
 - Live test (after linking): press TEST in the control panel; the spare
