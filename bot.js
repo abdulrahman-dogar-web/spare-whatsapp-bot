@@ -831,7 +831,7 @@ async function main() {
   const server = http.createServer((req, res) => {
     if (req.url === "/health" || req.url === "/") {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, bot: "spare-whatsapp-bot", connected, paused, state: paused ? "paused" : (connected ? "linked" : currentStatus), sent_today: sentToday, last_ntfy: lastNtfy, ntfy_server: ntfyServerStatus, ts: Date.now() }));
+      res.end(JSON.stringify({ ok: true, bot: "spare-whatsapp-bot", version: "2.13.1", connected, paused, state: paused ? "paused" : (connected ? "linked" : currentStatus), sent_today: sentToday, last_ntfy: lastNtfy, ntfy_server: ntfyServerStatus, ntfy_exists: fs.existsSync(path.join(__dirname, "ntfy")), ntfy_path: path.join(__dirname, "ntfy"), cwd: process.cwd(), ts: Date.now() }));
     } else if (req.url === "/signal" && req.method === "POST") {
       handlePushSignal(req, res);
     } else if (req.url === "/ntfy-test" && req.method === "POST") {
