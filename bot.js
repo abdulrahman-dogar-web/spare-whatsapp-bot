@@ -11,24 +11,34 @@
  * fallback (see ../spare-call/SETUP-TERMUX.md).
  *   $ node bot.js            # QR link mode (default; QR also shown on the
  *                           # control panel — scan from spare WhatsApp)
- *   $ LINK_MODE=code node bot.js   # pairing-code mode (8-digit code, in logs
- *                           # AND on the panel as a fallback)
+ *   $ LINK_MODE=code node bot.js   # same, but no terminal QR print
+ *                           # (the pairing code is posted in BOTH modes
+ *                           # since v2.5 — LINK_MODE no longer gates it)
  *   $ DRY_RUN=1 node bot.js  # poll + log only, never send, never ack
  *
- * LINKING (v2.1): the bot posts its link QR (PNG data URL) and any pairing
- * code to the Worker (/spare-link) so the control panel shows them — the
- * user scans the QR on the panel, no log-diving needed. It also posts a
- * status heartbeat (/spare-status) every 60s and on every change, so the
- * Worker can tell the user on Discord if the sending number goes down.
+ * LINKING (v2.5): the bot posts its link QR (PNG data URL) AND a pairing
+ * code to the Worker (/spare-link) so the control panel shows BOTH — the
+ * user scans the QR or enters the code on the spare WhatsApp. The code
+ * is requested (max once a minute) whenever the socket is unregistered;
+ * a socket restart resets the throttle so a dead code is replaced right
+ * away. The QR expires after ~20s, which is why a stale panel QR can
+ * fail with "COULDN'T LOGIN" — the code is the reliable second method.
+ * It also posts a status heartbeat (/spare-status) every 60s and on every
+ * change, so the Worker can tell the user on Discord if the sending
+ * number goes down.
  *
- * BOT TAB COMMANDS (v2.2): the panel's Bot tab sends commands through a KV
- * command channel on the Worker (GET/POST /spare-command, same token).
- * The bot checks for a pending command on every 10s poll and acks it after
- * executing: RECONNECT closes the socket and reconnects at once (session
- * kept — no re-link); RESTART exits so Render restarts the service; STOP
- * pauses sending (alerts stay queued) while the bot keeps heartbeating
- * with state "paused" (so the Worker's down-detection does not fire);
- * RESUME unpauses. MANUAL PING is Worker-side (no bot involvement).
+ * BOT TAB COMMANDS (v2.2 + v2.5): the panel's Bot tab sends commands
+ * through a KV command channel on the Worker (GET/POST /spare-command,
+ * same token). The bot checks for a pending command on every 10s poll
+ * and acks it after executing: RECONNECT closes the socket and
+ * reconnects at once (session kept — no re-link); RESTART exits so
+ * Render restarts the service; STOP pauses sending (alerts stay queued)
+ * while the bot keeps heartbeating with state "paused" (so the Worker's
+ * down-detection does not fire); RESUME unpauses. MANUAL PING is
+ * Worker-side (no bot involvement). v2.5 adds: PAIRING-CODE (panel "Get
+ * a fresh code" — forces an immediate fresh code request, bypassing
+ * the 60s throttle once) and REFRESH-QR (reconnects the socket so
+ * Baileys makes a brand-new QR for the panel).
  *
  * Env:
  *   WORKER_URL    default https://dogar-alerts.abdulrahman-dogar.workers.dev
@@ -338,7 +348,7 @@ function ownNumberDigits(sock) {
 // The panel's Bot tab writes commands to the Worker (KV panel:bot-command);
 // the bot reads them here on every poll loop and acks each after executing.
 // Exported for the self-test / verification script (same code main() uses).
-const BOT_COMMANDS = ["ping", "reconnect", "restart", "stop", "resume"];
+const BOT_COMMANDS = ["ping", "reconnect", "restart", "stop", "resume", "pairing-code", "refresh-qr"];
 function isValidBotCommand(action) {
   return BOT_COMMANDS.includes(String(action || "").trim().toLowerCase());
 }
@@ -418,6 +428,29 @@ async function main() {
   let lastLink = { qrDataUrl: null, code: null };
   let currentStatus = "connecting";
 
+  // Request a fresh pairing code (v2.5): posted to /spare-link ALONGSIDE
+  // the QR. `force` (panel "Get a fresh code") bypasses the 60s throttle
+  // once. Returns {ok, code} or {ok:false, reason}. Never throws.
+  async function requestPairingCodeNow(force) {
+    if (!sock || !sock.authState || !sock.authState.creds || sock.authState.creds.registered) {
+      return { ok: false, reason: "already registered" };
+    }
+    if (!force && Date.now() - pairingCodeShownAt <= 60000) {
+      return { ok: false, reason: "throttled (max once a minute)" };
+    }
+    try {
+      pairingCodeShownAt = Date.now();
+      const code = await sock.requestPairingCode(SPARE_PHONE);
+      lastLink = { qrDataUrl: lastLink.qrDataUrl, code };
+      await postLink(lastLink);
+      log("PAIRING CODE (enter in spare WhatsApp > Settings > Linked Devices > Link a Device > Link with phone number instead): " + code);
+      return { ok: true, code };
+    } catch (e) {
+      log("pairing code request failed: " + String((e && e.message) || e).slice(0, 120));
+      return { ok: false, reason: String((e && e.message) || e).slice(0, 80) };
+    }
+  }
+
   // /health server — Render requires the service to bind $PORT, and the
   // Worker's cron keep-alive pings this endpoint every 5 minutes.
   const server = http.createServer((req, res) => {
@@ -446,7 +479,7 @@ async function main() {
 
       if (qr) {
         // Post the QR to the panel in BOTH modes (the panel QR is the
-        // primary link method; the pairing code is the fallback display).
+        // primary link method; the pairing code is shown next to it).
         try {
           const dataUrl = await QRCode.toDataURL(qr, { width: 512, margin: 1 });
           lastLink = { qrDataUrl: dataUrl, code: lastLink.code || null };
@@ -454,19 +487,13 @@ async function main() {
         } catch (e) {
           log("QR render/post failed: " + String((e && e.message) || e).slice(0, 100));
         }
+        // Pairing code (v2.5): requested in BOTH modes, next to the QR —
+        // the user asked for both login methods at once. Throttled to
+        // once a minute; a socket restart resets the throttle so a dead
+        // code is replaced right away (see the close handler).
+        await requestPairingCodeNow(false);
         if (LINK_MODE === "code") {
-          // Pairing code mode: request a fresh 8-digit code (max once a minute).
-          if (!sock.authState.creds.registered && Date.now() - pairingCodeShownAt > 60000) {
-            try {
-              pairingCodeShownAt = Date.now();
-              const code = await sock.requestPairingCode(SPARE_PHONE);
-              lastLink = { qrDataUrl: lastLink.qrDataUrl, code };
-              await postLink(lastLink);
-              log("PAIRING CODE (enter in spare WhatsApp > Settings > Linked Devices > Link a Device > Link with phone number instead): " + code);
-            } catch (e) {
-              log("pairing code request failed: " + String((e && e.message) || e).slice(0, 120));
-            }
-          }
+          log("PAIRING CODE mode — the code is also on the control panel");
         } else {
           log("QR LINK — scan with the SPARE WhatsApp (+923703832506): Settings > Linked Devices > Link a Device (or scan the QR on the control panel)");
           qrcode.generate(qr, { small: true });
@@ -507,6 +534,9 @@ async function main() {
         }
         currentStatus = "disconnected";
         await postStatus("disconnected", ownNumberDigits(sock));
+        // v2.5: a socket restart invalidates the pairing code — reset the
+        // throttle so the next qr event requests a fresh one right away.
+        pairingCodeShownAt = 0;
         // Exponential backoff (5s -> 10s -> 20s -> 40s -> 60s max): a dead
         // socket must not hammer WhatsApp with constant reconnects.
         // A panel RECONNECT skips the backoff and reconnects at once.
@@ -569,6 +599,30 @@ async function main() {
       paused = false;
       await postStatus(currentStatus, ownNumberDigits(sock));
       result = "resumed — sending live again";
+    } else if (action === "pairing-code") {
+      // v2.5: panel "Get a fresh code" — force an immediate fresh code
+      // request, bypassing the 60s throttle once. The code is posted to
+      // /spare-link and shows in the panel's Link tab.
+      const r = await requestPairingCodeNow(true);
+      result = r.ok
+        ? "fresh pairing code posted to the panel: " + r.code
+        : "pairing code not requested: " + r.reason;
+    } else if (action === "refresh-qr") {
+      // v2.5: panel "Refresh QR" — reconnect the socket so Baileys makes
+      // a brand-new QR (same as RECONNECT; the close handler resets the
+      // pairing-code throttle, so a fresh code comes with it).
+      if (!connected || !sock) {
+        result = "already reconnecting (not connected) — a fresh QR will appear shortly";
+      } else {
+        manualReconnect = true;
+        try {
+          sock.end(); // close event fires; the handler reconnects at once
+          result = "refreshing QR — socket closed, reconnecting now; a fresh QR will appear on the panel in a few seconds";
+        } catch (e) {
+          manualReconnect = false;
+          result = "QR refresh failed: " + String((e && e.message) || e).slice(0, 80);
+        }
+      }
     } else {
       result = "unknown action ignored: " + action;
     }

@@ -67,11 +67,17 @@ that holds the spare WhatsApp (+923703832506): WhatsApp -> Settings ->
 Linked Devices -> Link a Device -> scan the QR. The QR refreshes itself
 while unlinked.
 
-- **Pairing-code fallback:** set `LINK_MODE=code` in the Render env vars
-  (or run `LINK_MODE=code node bot.js`). The 8-digit code appears on the
-  panel AND in the Render logs. Same phone: WhatsApp -> Settings -> Linked
+- **Pairing code (same thing, second method — v2.5):** the bot requests
+  an 8-digit code in BOTH modes and shows it on the panel next to the QR
+  (big digits + Copy button). Same phone: WhatsApp -> Settings -> Linked
   Devices -> Link a Device -> **Link with phone number instead** -> enter
-  the code. (A fresh code is requested at most once a minute until linked.)
+  the code. Use the code when a QR scan fails ("COULDN'T LOGIN") — a QR
+  expires after ~20s and the panel can show a stale one; the code is the
+  reliable method. "Get a fresh code" on the panel forces a new code
+  (1/min). A fresh code is requested at most once a minute until linked,
+  and a socket restart resets the throttle so a dead code is replaced.
+  (`LINK_MODE=code` still exists but only suppresses the terminal QR
+  print — it no longer gates the code.)
 - **Termux:** `bash run-bot.sh` — a QR appears in Termux (and on the
   panel too). Same phone: WhatsApp -> Settings -> Linked Devices ->
   Link a Device -> scan the QR.
@@ -119,6 +125,10 @@ controls — all from the panel, no Render login needed:
 - **STOP / RESUME** — STOP pauses sending (alerts stay queued); the bot
   keeps heartbeating with state "paused", so no "down" alert fires.
   RESUME unpauses it.
+- **Get a fresh code (Link tab, v2.5)** — forces an immediate fresh
+  pairing-code request (bypasses the 60s throttle once). 1/min.
+- **Refresh QR (Link tab, v2.5)** — reconnects the socket so Baileys
+  makes a brand-new QR for the panel. 1/min.
 
 How it works: the panel writes a command to the Worker's KV command
 channel (`POST /panel/api/bot-command`); the bot checks for a pending
