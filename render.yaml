@@ -13,6 +13,7 @@ services:
     name: spare-whatsapp-bot
     runtime: node
     plan: free
+    autoDeploy: true
     buildCommand: npm install && curl -fsSL -o /tmp/ntfy.tar.gz https://github.com/binwiederhier/ntfy/releases/download/v2.36.0/ntfy_2.36.0_linux_amd64.tar.gz && echo "d2c76d17c4bde762913b1cbbf5ca2ac74c3eade36befb0989b44e7877c8596c2  /tmp/ntfy.tar.gz" | sha256sum -c - && tar -xzf /tmp/ntfy.tar.gz -C /tmp ntfy_2.36.0_linux_amd64/ntfy && cp /tmp/ntfy_2.36.0_linux_amd64/ntfy ./ntfy && chmod +x ./ntfy && rm -rf /tmp/ntfy.tar.gz /tmp/ntfy_2.36.0_linux_amd64
     startCommand: node bot.js
     healthCheckPath: /health
