@@ -18,22 +18,33 @@
  * stands. A per-item dry_run flag lets the Worker verify image handling
  * without sending anything (token-authenticated; the Worker never sets
  * dry_run in production).
- * ntfy alarm (v2.11, title-sanitized in v2.12): the BOT — not the
- * Worker — publishes the ntfy phone alarm. Cloudflare Workers share a
- * small pool of egress IPs with thousands of other users, so ntfy.sh's
- * per-IP quota (250 msgs/day) is exhausted by strangers and even a
- * first-ever post gets HTTP 429 (seen 2026-11-11 on the panel Test
- * alarm button). The Render bot's IP is far less crowded. The Worker
- * attaches an ntfy block {topic, enabled, title} to the FIRST
+ * ntfy alarm (v2.11, title-sanitized in v2.12, self-hosted in v2.13):
+ * the BOT — not the Worker — publishes the ntfy phone alarm. The
+ * Worker's egress IPs hit ntfy.sh's per-IP quota (250 msgs/day,
+ * exhausted by strangers — even a first-ever post got HTTP 429 on the
+ * panel Test alarm button, 2026-11-11), and the diagnosis is error
+ * 42908 "daily message quota reached" (ntfy.sh shares one quota per
+ * egress IP). So v2.13 runs ntfy ITSELF, inside this same Render
+ * service (a second free Render service is impossible — 750 free
+ * instance hours/month, this bot alone uses ~744h): the bot spawns
+ * the ntfy binary as a child process listening on 127.0.0.1:2586,
+ * publishes to it over loopback (exempt from its own rate limits),
+ * and proxies all other HTTP paths to it, so the user's ntfy app
+ * subscribes to this bot's own URL instead of ntfy.sh. The Worker
+ * attaches an ntfy block {topic, enabled, title, server} to the FIRST
  * recipient's item only — three recipients still mean ONE alarm, not
- * three — and the bot POSTs to ntfy.sh/<topic> with Priority: 5 right
- * after the WhatsApp send succeeds (never before, never delaying it).
- * POST /ntfy-test is the panel "Test alarm" button's endpoint (same
- * SPARE_TOKEN auth). v2.12: the title is sanitized to ASCII/Latin1
- * before it is set as the "Title" header — the test title's em-dash
- * and signal titles' emoji made Node's fetch throw a ByteString error
- * on the first Test alarm press; the catch now also keeps the FULL
- * error message (500 chars) so failures show completely.
+ * three — and the bot POSTs to <server>/<topic> with Priority: 5
+ * right after the WhatsApp send succeeds (never before, never
+ * delaying it). POST /ntfy-test is the panel "Test alarm" button's
+ * endpoint (same SPARE_TOKEN auth). v2.12: the title is sanitized to
+ * ASCII/Latin1 before it is set as the "Title" header — the test
+ * title's em-dash and signal titles' emoji made Node's fetch throw a
+ * ByteString error on the first Test alarm press; the catch now also
+ * keeps the FULL error message (500 chars) so failures show
+ * completely. v2.13: a 4xx publish captures the ntfy error code from
+ * the response body (e.g. ntfy_http_429_code_42908_...) and is never
+ * retried elsewhere; a network error or 5xx falls back once to the
+ * Worker-provided server, then ntfy.sh.
  * A dry-run item that explicitly carries an ntfy block also posts —
  * production never attaches ntfy to dry-run items, so this is the
  * verification hook only (proves the bot's egress IP reaches ntfy.sh
@@ -113,6 +124,7 @@ const pino = require("pino");
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const { spawn } = require("child_process"); // v2.13: local ntfy server subprocess
 
 const MAIN_NUMBER = "923001412943"; // main number — default recipient
 const SPARE_PHONE = (process.env.SPARE_PHONE || "923703832506").replace(/\D/g, "");
@@ -211,13 +223,18 @@ function applyDelayToken(text, receivedAt, nowMs) {
   return t + "\n⚡ Delivered in " + d;
 }
 
-// ---- ntfy.sh alarm (v2.11, title-sanitized in v2.12) ----
-// The bot — not the Worker — publishes the alarm (see header). POST
-// https://ntfy.sh/<topic> with Priority: 5 (max): Android plays a
-// continuous alarm and bypasses silent/DND. Pure helper (exported for
-// the self-test). timeoutMs caps the wait (3s on the signal path so a
-// slow ntfy.sh can never eat the Worker's 5s push budget; 5s for the
-// test endpoint, where the user is waiting for the result).
+// ---- ntfy alarm (v2.11, title-sanitized in v2.12, self-hosted in v2.13) ----
+// The bot — not the Worker — publishes the alarm (see header). v2.13:
+// the publish target is the SELF-HOSTED ntfy server running inside
+// this same service (127.0.0.1:2586) whenever the Worker names this
+// bot's own public URL as the server; the loopback address is exempt
+// from ntfy's own rate limits, so a publish there can never 429.
+// POST <server>/<topic> with Priority: 5 (max): Android plays a
+// continuous alarm and bypasses silent/DND. Pure helpers (exported
+// for the self-test). timeoutMs caps the wait per attempt (3s on the
+// signal path so a slow ntfy can never eat the Worker's 5s push
+// budget; 5s for the test endpoint, where the user is waiting for
+// the result).
 //
 // v2.12 (2026-11-11): the ntfy TITLE travels as an HTTP header
 // ("Title"), and Node's fetch (undici) rejects header values with any
@@ -230,6 +247,34 @@ function applyDelayToken(text, receivedAt, nowMs) {
 // emoji in the body is fine, it is the POST body (UTF-8), not a header.
 // The catch now keeps the FULL error message (500 chars, was 60) so
 // the panel console shows a failure completely instead of cut off.
+//
+// v2.13: a non-2xx publish reads the response body and reports the
+// ntfy error code when it is JSON (e.g. 42908 "daily message quota
+// reached" -> ntfy_http_429_code_42908_limit_reached_daily_message_
+// quota_reached), so the panel console shows WHY ntfy refused it
+// instead of a bare status. A 4xx (including 429) is final — the
+// quota is per egress IP, so another server would refuse the same
+// message too. A network error or 5xx falls back ONCE per remaining
+// candidate: the Worker-provided server URL (if it was not the one
+// just tried), then https://ntfy.sh.
+const NTFY_LOCAL_URL = "http://127.0.0.1:2586";
+const NTFY_DEFAULT_SERVER = "https://ntfy.sh";
+const BOT_PUBLIC_URL = (process.env.RENDER_EXTERNAL_URL || "https://spare-whatsapp-bot.onrender.com").replace(/\/+$/, "");
+
+function normalizeServerUrl(u) {
+  return String(u || "").trim().replace(/\/+$/, "");
+}
+
+// Resolve the publish base URL for a Worker-provided server URL:
+// the bot's own public URL means the LOCAL loopback ntfy (avoids the
+// public round-trip); anything else is used as given; no server means
+// ntfy.sh (the pre-v2.13 behaviour). Exported for the self-test.
+function resolveNtfyBase(serverUrl) {
+  const s = normalizeServerUrl(serverUrl);
+  if (!s) return NTFY_DEFAULT_SERVER;
+  if (s.toLowerCase() === BOT_PUBLIC_URL.toLowerCase()) return NTFY_LOCAL_URL;
+  return s;
+}
 function sanitizeNtfyTitle(title) {
   return String(title || "Signal")
     .replace(/[\u2013\u2014]/g, "-") // en-dash / em-dash -> "-"
@@ -241,21 +286,129 @@ function sanitizeNtfyTitle(title) {
 function isValidNtfyTopic(topic) {
   return typeof topic === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(topic);
 }
-async function sendNtfyAlarm(topic, title, text, timeoutMs) {
+// Build the result string for a 4xx publish: the ntfy error code and
+// message are read from the JSON error body when present
+// ({"code":42908,"http":429,"error":"limit reached: ..."}). res.text()
+// is guarded — it may fail, or the body may not be JSON — and a mock
+// without .text() at all must not crash: then the plain status is
+// returned. Total result is bounded to 500 chars.
+async function ntfyErrorResult(res) {
+  const status = res.status;
+  let code = null;
+  let errText = "";
+  try {
+    if (res && typeof res.text === "function") {
+      const raw = await res.text();
+      if (raw) {
+        try {
+          const data = JSON.parse(raw);
+          if (data && typeof data === "object") {
+            if (typeof data.code === "number") code = data.code;
+            if (typeof data.error === "string") errText = data.error;
+          }
+        } catch (e) {
+          /* body is not JSON — keep the plain status */
+        }
+      }
+    }
+  } catch (e) {
+    /* res.text() failed — keep the plain status */
+  }
+  let out = "ntfy_http_" + status;
+  if (code !== null) {
+    out += "_code_" + code;
+    if (errText) {
+      const slug = errText.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 80);
+      if (slug) out += "_" + slug;
+    }
+  }
+  return out.slice(0, 500);
+}
+async function sendNtfyAlarm(topic, title, text, timeoutMs, serverUrl) {
   const t = String(topic || "").trim();
   if (!t) return "ntfy_no_topic";
   if (!isValidNtfyTopic(t)) return "ntfy_bad_topic";
-  try {
-    const res = await fetch("https://ntfy.sh/" + encodeURIComponent(t), {
-      method: "POST",
-      headers: { "Priority": "5", "Title": sanitizeNtfyTitle(title), "Content-Type": "text/plain; charset=utf-8" },
-      body: String(text || "").slice(0, 4000),
-      signal: AbortSignal.timeout(Number(timeoutMs) > 0 ? Number(timeoutMs) : 5000),
-    });
-    return "ntfy_http_" + res.status;
-  } catch (e) {
-    return "ntfy_error_" + String((e && e.message) || e).slice(0, 500);
+  const timeout = Number(timeoutMs) > 0 ? Number(timeoutMs) : 5000;
+  // Fallback order (v2.13): the resolved server first; then the
+  // Worker-provided server URL (if it was not the one just tried);
+  // then https://ntfy.sh. Only a network error or a 5xx moves to the
+  // next candidate — a 4xx (including 429) returns at once with its
+  // ntfy error code, and a 2xx returns at once as success.
+  const primary = resolveNtfyBase(serverUrl);
+  const candidates = [primary];
+  const provided = normalizeServerUrl(serverUrl);
+  if (provided && provided !== primary) candidates.push(provided);
+  if (!candidates.includes(NTFY_DEFAULT_SERVER)) candidates.push(NTFY_DEFAULT_SERVER);
+  let lastStatus = 0;
+  let lastError = null;
+  for (const base of candidates) {
+    let res;
+    try {
+      res = await fetch(base + "/" + encodeURIComponent(t), {
+        method: "POST",
+        headers: { "Priority": "5", "Title": sanitizeNtfyTitle(title), "Content-Type": "text/plain; charset=utf-8" },
+        body: String(text || "").slice(0, 4000),
+        signal: AbortSignal.timeout(timeout),
+      });
+    } catch (e) {
+      lastError = e; // network error / timeout: try the next candidate
+      continue;
+    }
+    if (res.status >= 200 && res.status < 300) return "ntfy_http_" + res.status;
+    if (res.status >= 400 && res.status < 500) return await ntfyErrorResult(res);
+    lastStatus = res.status; // 5xx: try the next candidate
+    lastError = new Error("ntfy HTTP " + res.status);
   }
+  if (lastStatus) return "ntfy_http_" + lastStatus;
+  return "ntfy_error_" + String((lastError && lastError.message) || lastError || "all ntfy servers failed").slice(0, 500);
+}
+
+// ---- local ntfy HTTP proxy (v2.13) ----
+// The bot's HTTP server proxies every path that is NOT one of its own
+// routes to the local ntfy (127.0.0.1:2586) — this is how the user's
+// ntfy app, subscribed to the bot's public URL, reaches the local
+// server, including its long-lived SSE streams. Pure helper (exported
+// for the self-test / verification harness): method, path, query,
+// headers and body are forwarded; the upstream response streams back
+// without buffering; on upstream error / local ntfy down it answers
+// 502 (never crashes); on client disconnect the upstream request is
+// aborted. X-Forwarded-For carries the real client IP (Render sets it;
+// behind-proxy is true in ntfy-server.yml), falling back to the
+// socket address.
+function ntfyClientIp(req) {
+  const xff = req && req.headers && req.headers["x-forwarded-for"];
+  if (typeof xff === "string" && xff.trim()) return xff.split(",")[0].trim();
+  if (Array.isArray(xff) && xff.length) return String(xff[0]).split(",")[0].trim();
+  return (req && req.socket && req.socket.remoteAddress) || "127.0.0.1";
+}
+function proxyToLocalNtfy(req, res) {
+  const headers = { ...(req.headers || {}) };
+  delete headers["host"];
+  delete headers["connection"];
+  headers["x-forwarded-for"] = ntfyClientIp(req);
+  headers["host"] = "127.0.0.1:2586";
+  let upstream;
+  try {
+    upstream = http.request(
+      { host: "127.0.0.1", port: 2586, method: req.method, path: req.url, headers },
+      (upRes) => {
+        if (res.destroyed) return;
+        res.writeHead(upRes.statusCode || 502, upRes.headers);
+        upRes.pipe(res);
+      }
+    );
+  } catch (e) {
+    if (!res.headersSent) res.writeHead(502, { "content-type": "text/plain" });
+    res.end("ntfy unavailable");
+    return;
+  }
+  upstream.on("error", () => {
+    if (!res.headersSent) res.writeHead(502, { "content-type": "text/plain" });
+    if (!res.writableEnded) res.end("ntfy unavailable");
+  });
+  req.on("aborted", () => { try { upstream.destroy(); } catch (e) { /* already gone */ } });
+  res.on("close", () => { if (!res.writableEnded) { try { upstream.destroy(); } catch (e) { /* already gone */ } } });
+  req.pipe(upstream);
 }
 
 // ---- Baileys auth in Cloudflare KV (via the Worker /spare-auth) ----
@@ -550,10 +703,84 @@ async function main() {
   // in /health so the Worker console can see it without another call.
   let lastNtfy = null;
 
-  // ntfy alarm (v2.11): post the alarm for an item that carries an ntfy
-  // block {topic, enabled, title}. Called AFTER the WhatsApp send
-  // succeeds (or for a dry-run verification item) — it never delays a
-  // send. Returns the result string ("ntfy_http_200", "ntfy_http_429",
+  // ---- local ntfy server (v2.13, subprocess) ----
+  // The ntfy binary (downloaded at Render build time, ./ntfy) runs as
+  // a child process listening on 127.0.0.1:2586 with the committed
+  // ntfy-server.yml config; base-url is filled in at startup from
+  // RENDER_EXTERNAL_URL (fallback: the known public URL) so it can
+  // never go stale. Started here, before connect(), so alarms work
+  // from the first signal. On crash it restarts with a 5s backoff,
+  // max 5 restarts, then gives up (status "down") — publishes still
+  // fall back to ntfy.sh via sendNtfyAlarm. If the binary is missing
+  // (e.g. an older deploy), the bot keeps working for WhatsApp and
+  // every publish goes to ntfy.sh.
+  const NTFY_MAX_RESTARTS = 5;
+  const NTFY_RESTART_BACKOFF_MS = 5000;
+  let ntfyServerStatus = "not_installed"; // "running" | "down" | "not_installed"
+  let ntfyProc = null;
+  let ntfyRestarts = 0;
+  function startLocalNtfy() {
+    const bin = path.join(__dirname, "ntfy");
+    if (!fs.existsSync(bin)) {
+      ntfyServerStatus = "not_installed";
+      log("local ntfy: ./ntfy binary not installed — ntfy publishes fall back to ntfy.sh");
+      return;
+    }
+    let cfgText;
+    try {
+      cfgText = fs.readFileSync(path.join(__dirname, "ntfy-server.yml"), "utf-8");
+    } catch (e) {
+      ntfyServerStatus = "down";
+      log("local ntfy: ntfy-server.yml missing (" + String((e && e.message) || e).slice(0, 80) + ") — not starting");
+      return;
+    }
+    if (!cfgText.includes("{{BASE_URL}}")) {
+      ntfyServerStatus = "down";
+      log("local ntfy: ntfy-server.yml has no {{BASE_URL}} placeholder — not starting");
+      return;
+    }
+    const runtimeCfg = path.join(__dirname, "ntfy-server.runtime.yml");
+    try {
+      fs.writeFileSync(runtimeCfg, cfgText.replace("{{BASE_URL}}", BOT_PUBLIC_URL));
+    } catch (e) {
+      ntfyServerStatus = "down";
+      log("local ntfy: cannot write runtime config (" + String((e && e.message) || e).slice(0, 80) + ") — not starting");
+      return;
+    }
+    log("local ntfy: starting ./ntfy (base-url " + BOT_PUBLIC_URL + ", listen 127.0.0.1:2586)");
+    try {
+      ntfyProc = spawn(bin, ["serve", "-c", runtimeCfg], { stdio: ["ignore", "pipe", "pipe"] });
+    } catch (e) {
+      ntfyServerStatus = "down";
+      log("local ntfy: spawn failed (" + String((e && e.message) || e).slice(0, 120) + ")");
+      return;
+    }
+    ntfyServerStatus = "running";
+    ntfyProc.stdout.on("data", (d) => log("[ntfy] " + String(d).trim().slice(0, 200)));
+    ntfyProc.stderr.on("data", (d) => log("[ntfy] " + String(d).trim().slice(0, 200)));
+    ntfyProc.on("error", (e) => {
+      ntfyServerStatus = "down";
+      log("local ntfy: process error (" + String((e && e.message) || e).slice(0, 120) + ")");
+    });
+    ntfyProc.on("exit", (code, signal) => {
+      ntfyProc = null;
+      ntfyServerStatus = "down";
+      if (ntfyRestarts < NTFY_MAX_RESTARTS) {
+        ntfyRestarts++;
+        log(`local ntfy: exited (code=${code} signal=${signal}) — restart ${ntfyRestarts}/${NTFY_MAX_RESTARTS} in ${NTFY_RESTART_BACKOFF_MS / 1000}s`);
+        setTimeout(startLocalNtfy, NTFY_RESTART_BACKOFF_MS);
+      } else {
+        log("local ntfy: exited and restart limit reached — giving up; ntfy publishes fall back to ntfy.sh");
+      }
+    });
+  }
+  startLocalNtfy();
+
+  // ntfy alarm (v2.11, server wired through in v2.13): post the alarm
+  // for an item that carries an ntfy block {topic, enabled, title,
+  // server}. Called AFTER the WhatsApp send succeeds (or for a
+  // dry-run verification item) — it never delays a send. Returns the
+  // result string ("ntfy_http_200", "ntfy_http_429_code_42908_...",
   // ...), or null when the item carries no ntfy block / it is disabled
   // / the topic is empty. Records the result in lastNtfy.
   async function maybePostNtfy(item, text) {
@@ -561,7 +788,7 @@ async function main() {
     if (!n || typeof n !== "object" || n.enabled === false) return null;
     const topic = String(n.topic || "").trim();
     if (!topic) return null;
-    const result = await sendNtfyAlarm(topic, String(n.title || "Signal").slice(0, 100), text, 3000);
+    const result = await sendNtfyAlarm(topic, String(n.title || "Signal").slice(0, 100), text, 3000, n.server);
     lastNtfy = { result, topic, ts: Date.now() };
     log(`ntfy alarm — ${result} (topic ${topic})`);
     return result;
@@ -604,22 +831,28 @@ async function main() {
   const server = http.createServer((req, res) => {
     if (req.url === "/health" || req.url === "/") {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, bot: "spare-whatsapp-bot", connected, paused, state: paused ? "paused" : (connected ? "linked" : currentStatus), sent_today: sentToday, last_ntfy: lastNtfy, ts: Date.now() }));
+      res.end(JSON.stringify({ ok: true, bot: "spare-whatsapp-bot", connected, paused, state: paused ? "paused" : (connected ? "linked" : currentStatus), sent_today: sentToday, last_ntfy: lastNtfy, ntfy_server: ntfyServerStatus, ts: Date.now() }));
     } else if (req.url === "/signal" && req.method === "POST") {
       handlePushSignal(req, res);
     } else if (req.url === "/ntfy-test" && req.method === "POST") {
       handleNtfyTest(req, res);
-    } else {
+    } else if (req.url.split("?")[0] === "/signal" || req.url.split("?")[0] === "/ntfy-test") {
+      // Bot route, wrong method (only POST is valid) — keep the old 404.
       res.writeHead(404);
       res.end("not found");
+    } else {
+      // v2.13: every other path is proxied to the local ntfy server
+      // (the user's ntfy app subscribes to this bot's URL).
+      proxyToLocalNtfy(req, res);
     }
   });
   server.listen(PORT, "0.0.0.0", () => log("health server on :" + PORT));
 
-  // POST /ntfy-test (v2.11): the Worker's panel "Test alarm" button
-  // asks the BOT to post the test message (auth: SPARE_TOKEN, same as
-  // /signal). Body {token, topic, title, body}. Returns
-  // {ok:true, result:"ntfy_http_200", topic} on success. Only the
+  // POST /ntfy-test (v2.11, server wired through in v2.13): the
+  // Worker's panel "Test alarm" button asks the BOT to post the test
+  // message (auth: SPARE_TOKEN, same as /signal). Body {token, topic,
+  // title, body, server} — v2.17 Worker sends server; v2.13 honours
+  // it. Returns {ok:true, result:"ntfy_http_200", topic} on success. Only the
   // Worker calls this (via the panel button the user presses himself);
   // the button is rate-limited to 1/min Worker-side.
   async function handleNtfyTest(req, res) {
@@ -647,7 +880,7 @@ async function main() {
         res.end(JSON.stringify({ ok: false, error: "bad_topic" }));
         return;
       }
-      const result = await sendNtfyAlarm(topic, String(b.title || "Test alarm — Dogar Alerts").slice(0, 100), String(b.body || ""), 5000);
+      const result = await sendNtfyAlarm(topic, String(b.title || "Test alarm — Dogar Alerts").slice(0, 100), String(b.body || ""), 5000, b.server);
       lastNtfy = { result, topic, ts: Date.now() };
       log(`ntfy test — ${result} (topic ${topic})`);
       if (/^ntfy_http_2/.test(result)) {
@@ -1048,4 +1281,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { stripLinks, assertQueuedJid, isValidSignalItem, formatDelay, applyDelayToken, sendNtfyAlarm, sanitizeNtfyTitle, isValidNtfyTopic, toStorable, fromStorable, readCount, isRecentlySent, markSent, ownNumberDigits, isValidBotCommand, fetchBotCommand, ackBotCommand, MAIN_NUMBER };
+module.exports = { stripLinks, assertQueuedJid, isValidSignalItem, formatDelay, applyDelayToken, sendNtfyAlarm, sanitizeNtfyTitle, isValidNtfyTopic, resolveNtfyBase, proxyToLocalNtfy, toStorable, fromStorable, readCount, isRecentlySent, markSent, ownNumberDigits, isValidBotCommand, fetchBotCommand, ackBotCommand, MAIN_NUMBER };

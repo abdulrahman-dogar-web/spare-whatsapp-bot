@@ -1,0 +1,30 @@
+# ntfy self-hosted server config — spare-whatsapp-bot v2.13
+#
+# The bot spawns the ntfy binary as a child process with THIS file
+# (base-url is filled in at startup from RENDER_EXTERNAL_URL, so the
+# public URL can never go stale — the BASE_URL placeholder on the
+# base-url line below is replaced by bot.js before the binary starts;
+# do not put a real URL here, and keep the placeholder text out of
+# these comments so bot.js replaces the right occurrence). The server listens on loopback only (127.0.0.1:2586);
+# the bot proxies its own public URL to it, and publishes alarms to
+# it over loopback.
+#
+# Verified against ntfy v2.36.0 (server.go / server/errors.go):
+# - visitor-message-daily-limit is INTENTIONALLY UNSET (0 = no daily
+#   cap). There are no visitor-message-limit-burst/replenish keys.
+# - visitor-request-limit-exempt-hosts 127.0.0.1,::1: an exempt IP
+#   skips BOTH the request bucket AND the daily-message check, so
+#   loopback publishes from the bot can never 429.
+# - upstream-base-url is INTENTIONALLY UNSET (default empty): this
+#   server never contacts ntfy.sh at all.
+# - behind-proxy: true — the bot sets X-Forwarded-For to the real
+#   client IP when proxying, so subscriber limits see real IPs.
+
+listen-http: "127.0.0.1:2586"
+base-url: "{{BASE_URL}}"
+behind-proxy: true
+cache-file: "./ntfy-cache.db"
+cache-duration: "12h"
+visitor-request-limit-burst: 100000
+visitor-request-limit-replenish: "1s"
+visitor-request-limit-exempt-hosts: "127.0.0.1,::1"

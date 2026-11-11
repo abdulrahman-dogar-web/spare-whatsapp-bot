@@ -2,6 +2,8 @@
 # Deploy: Render dashboard -> New -> Blueprint -> connect this repo.
 # This must be the ONLY free web service in the Render workspace
 # (750 free instance hours/month; one service running 24/7 uses 720-744h).
+# v2.13: the ntfy alarm server now runs INSIDE this service (the bot
+# spawns the ntfy binary as a child process) — no second service.
 # Env var SPARE_TOKEN is set in the Render dashboard (never in this file).
 # Link mode defaults to QR (the QR is shown on the control panel);
 # LINK_MODE=code is the fallback (pairing code, also shown on the panel).
@@ -11,7 +13,7 @@ services:
     name: spare-whatsapp-bot
     runtime: node
     plan: free
-    buildCommand: npm install
+    buildCommand: npm install && curl -fsSL -o /tmp/ntfy.tar.gz https://github.com/binwiederhier/ntfy/releases/download/v2.36.0/ntfy_2.36.0_linux_amd64.tar.gz && echo "d2c76d17c4bde762913b1cbbf5ca2ac74c3eade36befb0989b44e7877c8596c2  /tmp/ntfy.tar.gz" | sha256sum -c - && tar -xzf /tmp/ntfy.tar.gz -C /tmp ntfy_2.36.0_linux_amd64/ntfy && cp /tmp/ntfy_2.36.0_linux_amd64/ntfy ./ntfy && chmod +x ./ntfy && rm -rf /tmp/ntfy.tar.gz /tmp/ntfy_2.36.0_linux_amd64
     startCommand: node bot.js
     healthCheckPath: /health
     envVars:
