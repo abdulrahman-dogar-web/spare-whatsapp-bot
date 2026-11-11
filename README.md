@@ -104,3 +104,24 @@ Linked Devices -> remove it (then the bot will clear KV auth and stop).
 - `KV auth save failed` = the Worker could not be reached; the bot keeps
   running with the in-memory session and retries on the next update. If
   the bot restarts before a save succeeds, it may need a fresh link.
+
+## Bot tab controls (v2.2)
+
+The control panel has a Bot tab (🤖 Bot in the side menu). It shows the
+bot's live status (linked number, last seen, Render health) and these
+controls — all from the panel, no Render login needed:
+
+- **MANUAL PING** — the Worker GETs the Render service right now (the same
+  check as the 5-minute cron) and shows HTTP status + ms.
+- **RECONNECT** — closes the WhatsApp socket and reconnects at once.
+  The saved session is kept, so no re-link is needed.
+- **RESTART** — the bot exits and Render restarts the service.
+- **STOP / RESUME** — STOP pauses sending (alerts stay queued); the bot
+  keeps heartbeating with state "paused", so no "down" alert fires.
+  RESUME unpauses it.
+
+How it works: the panel writes a command to the Worker's KV command
+channel (`POST /panel/api/bot-command`); the bot checks for a pending
+command on every 10-second poll (`GET /spare-command`) and acks it
+(`POST /spare-command {ack, result}`) after executing. In `DRY_RUN`
+commands are only simulated (acked, no state change).

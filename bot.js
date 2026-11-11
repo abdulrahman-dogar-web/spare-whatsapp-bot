@@ -21,6 +21,15 @@
  * status heartbeat (/spare-status) every 60s and on every change, so the
  * Worker can tell the user on Discord if the sending number goes down.
  *
+ * BOT TAB COMMANDS (v2.2): the panel's Bot tab sends commands through a KV
+ * command channel on the Worker (GET/POST /spare-command, same token).
+ * The bot checks for a pending command on every 10s poll and acks it after
+ * executing: RECONNECT closes the socket and reconnects at once (session
+ * kept — no re-link); RESTART exits so Render restarts the service; STOP
+ * pauses sending (alerts stay queued) while the bot keeps heartbeating
+ * with state "paused" (so the Worker's down-detection does not fire);
+ * RESUME unpauses. MANUAL PING is Worker-side (no bot involvement).
+ *
  * Env:
  *   WORKER_URL    default https://dogar-alerts.abdulrahman-dogar.workers.dev
  *   SPARE_TOKEN   required — the SPARE_BOT_TOKEN Worker secret
@@ -325,6 +334,35 @@ function ownNumberDigits(sock) {
   }
 }
 
+// ---- Bot command channel (v2.2) ----
+// The panel's Bot tab writes commands to the Worker (KV panel:bot-command);
+// the bot reads them here on every poll loop and acks each after executing.
+// Exported for the self-test / verification script (same code main() uses).
+const BOT_COMMANDS = ["ping", "reconnect", "restart", "stop", "resume"];
+function isValidBotCommand(action) {
+  return BOT_COMMANDS.includes(String(action || "").trim().toLowerCase());
+}
+
+async function fetchBotCommand() {
+  const res = await fetch(`${WORKER_URL}/spare-command?token=${encodeURIComponent(SPARE_TOKEN)}`, { signal: AbortSignal.timeout(8000) });
+  if (!res.ok) throw new Error("spare-command GET HTTP " + res.status);
+  const data = await res.json();
+  if (!data.ok) throw new Error("spare-command error: " + (data.error || "?"));
+  return { pending: data.pending || null, last: data.last || null };
+}
+
+async function ackBotCommand(id, result) {
+  const res = await fetch(`${WORKER_URL}/spare-command`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: SPARE_TOKEN, ack: id, result: String(result || "").slice(0, 200) }),
+    signal: AbortSignal.timeout(8000),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) throw new Error("spare-command ack failed: HTTP " + res.status);
+  return data;
+}
+
 async function main() {
   if (!SPARE_TOKEN) {
     console.error("ERROR: SPARE_TOKEN env is required (the SPARE_BOT_TOKEN Worker secret).");
@@ -369,6 +407,13 @@ async function main() {
   let pairingCodeShownAt = 0;
   let sentToday = readCount();
   let reconnectAttempts = 0;
+  // Bot tab command state (v2.2): paused = STOP pressed (sending halted,
+  // heartbeats continue with state "paused"); manualReconnect = the panel
+  // asked for a RECONNECT (close the socket and reconnect at once, no
+  // backoff); lastCommandId = last command id seen (retried until acked).
+  let paused = false;
+  let manualReconnect = false;
+  let lastCommandId = null;
   // Panel link/status state (v2.1): last QR + code posted, last status posted.
   let lastLink = { qrDataUrl: null, code: null };
   let currentStatus = "connecting";
@@ -378,7 +423,7 @@ async function main() {
   const server = http.createServer((req, res) => {
     if (req.url === "/health" || req.url === "/") {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, bot: "spare-whatsapp-bot", connected, sent_today: sentToday, ts: Date.now() }));
+      res.end(JSON.stringify({ ok: true, bot: "spare-whatsapp-bot", connected, paused, state: paused ? "paused" : (connected ? "linked" : currentStatus), sent_today: sentToday, ts: Date.now() }));
     } else {
       res.writeHead(404);
       res.end("not found");
@@ -464,11 +509,15 @@ async function main() {
         await postStatus("disconnected", ownNumberDigits(sock));
         // Exponential backoff (5s -> 10s -> 20s -> 40s -> 60s max): a dead
         // socket must not hammer WhatsApp with constant reconnects.
+        // A panel RECONNECT skips the backoff and reconnects at once.
         reconnectAttempts++;
-        const delay = Math.min(
-          MAX_RECONNECT_DELAY_MS,
-          5000 * Math.pow(2, reconnectAttempts - 1)
-        );
+        const delay = manualReconnect
+          ? 0
+          : Math.min(
+            MAX_RECONNECT_DELAY_MS,
+            5000 * Math.pow(2, reconnectAttempts - 1)
+          );
+        manualReconnect = false;
         log(`reconnecting in ${delay / 1000}s (attempt ${reconnectAttempts})...`);
         await sleep(delay);
         connect();
@@ -478,12 +527,77 @@ async function main() {
 
   connect();
 
+  // Bot tab commands (v2.2): the panel writes them to the Worker's KV
+  // command channel; this checks for a pending command on every poll loop
+  // and acks it after executing. The id is marked seen only after the ack
+  // succeeds, so a failed ack is retried on the next poll (every action
+  // here is idempotent: stop/resume twice is harmless, and a restart
+  // exits the process, so it cannot double-run).
+  async function processCommand(cmd) {
+    const action = String(cmd.action || "").trim().toLowerCase();
+    if (DRY_RUN) {
+      await ackBotCommand(cmd.id, `dry-run: ${action} simulated`);
+      log(`command ${action} (dry-run: simulated, no state change)`);
+      return;
+    }
+    if (action === "restart") {
+      // Ack first (the process is about to exit and could not ack after).
+      await ackBotCommand(cmd.id, "restarting — Render will restart the service");
+      log("restart command: exiting in 500ms so Render restarts the service");
+      setTimeout(() => process.exit(0), 500);
+      return;
+    }
+    let result;
+    if (action === "reconnect") {
+      if (!connected || !sock) {
+        result = "already reconnecting (not connected)";
+      } else {
+        manualReconnect = true;
+        try {
+          sock.end(); // close event fires; the handler reconnects at once
+          result = "reconnecting — socket closed, reconnecting immediately (session kept)";
+        } catch (e) {
+          manualReconnect = false;
+          result = "reconnect failed: " + String((e && e.message) || e).slice(0, 80);
+        }
+      }
+    } else if (action === "stop") {
+      paused = true;
+      await postStatus("paused", ownNumberDigits(sock));
+      result = "paused — sending stopped, alerts stay queued";
+    } else if (action === "resume") {
+      paused = false;
+      await postStatus(currentStatus, ownNumberDigits(sock));
+      result = "resumed — sending live again";
+    } else {
+      result = "unknown action ignored: " + action;
+    }
+    await ackBotCommand(cmd.id, result);
+    log(`command ${action} done: ${result}`);
+  }
+
+  async function checkCommand() {
+    try {
+      const { pending } = await fetchBotCommand();
+      if (!pending || pending.id === lastCommandId) return;
+      log(`command received: ${pending.action} (id ${pending.id})`);
+      await processCommand(pending);
+      lastCommandId = pending.id;
+    } catch (e) {
+      log("command check failed: " + String((e && e.message) || e).slice(0, 100));
+    }
+  }
+
   // Poll loop — runs even while WhatsApp is down; items stay queued until sent.
   let polling = false;
   setInterval(async () => {
     if (polling) return;
     polling = true;
     try {
+      // Commands are checked first, on every poll — including while paused
+      // (a paused bot must still hear RESUME).
+      await checkCommand();
+      if (paused) return; // STOP: send nothing; items stay queued
       const items = await fetchPending();
       if (items.length === 0) return;
       log(`queue: ${items.length} pending`);
@@ -548,14 +662,16 @@ async function main() {
 
   // Status heartbeat (v2.1): every 60s so the Worker knows the bot is
   // alive — if it goes quiet for 10+ minutes after having linked once,
-  // the Worker posts a "sending number down" alert to Discord.
+  // the Worker posts a "sending number down" alert to Discord. While
+  // paused (v2.2) the bot keeps heartbeating with state "paused", so the
+  // down-detection does not fire.
   setInterval(() => {
-    postStatus(currentStatus, ownNumberDigits(sock)).catch(() => {});
+    postStatus(paused ? "paused" : currentStatus, ownNumberDigits(sock)).catch(() => {});
   }, 60 * 1000);
 
   // Keep the process alive and log a heartbeat hourly.
   setInterval(() => {
-    log(`heartbeat: connected=${connected} sent_today=${sentToday} dry_run=${DRY_RUN}`);
+    log(`heartbeat: connected=${connected} paused=${paused} sent_today=${sentToday} dry_run=${DRY_RUN}`);
   }, 3600 * 1000);
 }
 
@@ -566,4 +682,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { stripLinks, assertQueuedJid, toStorable, fromStorable, readCount, isRecentlySent, markSent, ownNumberDigits, MAIN_NUMBER };
+module.exports = { stripLinks, assertQueuedJid, toStorable, fromStorable, readCount, isRecentlySent, markSent, ownNumberDigits, isValidBotCommand, fetchBotCommand, ackBotCommand, MAIN_NUMBER };
