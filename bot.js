@@ -44,7 +44,12 @@
  * completely. v2.13: a 4xx publish captures the ntfy error code from
  * the response body (e.g. ntfy_http_429_code_42908_...) and is never
  * retried elsewhere; a network error or 5xx falls back once to the
- * Worker-provided server, then ntfy.sh.
+ * Worker-provided server, then ntfy.sh. v2.13.2: the bot installs the
+ * ntfy binary ITSELF at startup (download + SHA256 + extract,
+ * best-effort, ~60s max) — Render runs the dashboard build/start
+ * commands for this existing service and ignores render.yaml, so a
+ * deploy can go live with ./ntfy missing; the self-install makes the
+ * alarm work regardless of the build/start commands.
  * A dry-run item that explicitly carries an ntfy block also posts —
  * production never attaches ntfy to dry-run items, so this is the
  * verification hook only (proves the bot's egress IP reaches ntfy.sh
@@ -124,7 +129,11 @@ const pino = require("pino");
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
-const { spawn } = require("child_process"); // v2.13: local ntfy server subprocess
+const { spawn, execFile } = require("child_process"); // v2.13: local ntfy server subprocess; v2.13.2: execFile for tar extraction in the self-install
+const crypto = require("crypto"); // v2.13.2: SHA256 verification of the self-installed ntfy tarball
+const os = require("os"); // v2.13.2: temp dir for the self-install
+const { promisify } = require("util"); // v2.13.2: promisified execFile
+const execFileAsync = promisify(execFile);
 
 const MAIN_NUMBER = "923001412943"; // main number — default recipient
 const SPARE_PHONE = (process.env.SPARE_PHONE || "923703832506").replace(/\D/g, "");
@@ -361,6 +370,58 @@ async function sendNtfyAlarm(topic, title, text, timeoutMs, serverUrl) {
   }
   if (lastStatus) return "ntfy_http_" + lastStatus;
   return "ntfy_error_" + String((lastError && lastError.message) || lastError || "all ntfy servers failed").slice(0, 500);
+}
+
+// ---- ntfy binary self-install (v2.13.2) ----
+// Render runs the DASHBOARD build/start commands ('npm install' /
+// 'node bot.js') for this existing service — the render.yaml
+// buildCommand (which downloads ./ntfy) and startCommand (bash
+// start-render.sh) are ignored, so a deploy can go live with the
+// binary missing (ntfy_server: "not_installed", 2026-11-11) and no
+// build/start change can ever fix it. The bot therefore installs the
+// binary ITSELF at startup: if ./ntfy is missing (or not executable),
+// download the pinned ntfy release tarball, verify its SHA256, extract
+// the single binary with the system tar, and chmod +x it into dir.
+// Best-effort, bounded (~60s total: 45s download + 15s extract):
+// ANY failure only logs and returns false — the bot keeps running and
+// ntfy publishes fall back to ntfy.sh (the pre-v2.13 behaviour). It
+// never throws, never blocks the bot from starting, and never touches
+// ntfy-server.yml, the loopback server, the proxy, or alert behaviour.
+// Exported for the self-test / verification harness.
+const NTFY_RELEASE_URL = "https://github.com/binwiederhier/ntfy/releases/download/v2.36.0/ntfy_2.36.0_linux_amd64.tar.gz";
+const NTFY_RELEASE_SHA256 = "d2c76d17c4bde762913b1cbbf5ca2ac74c3eade36befb0989b44e7877c8596c2";
+const NTFY_RELEASE_MEMBER = "ntfy_2.36.0_linux_amd64/ntfy";
+async function ensureNtfyBinary(dir) {
+  const targetDir = dir || __dirname;
+  const bin = path.join(targetDir, "ntfy");
+  try {
+    if (fs.existsSync(bin)) {
+      try { fs.accessSync(bin, fs.constants.X_OK); return true; } catch (e) { /* exists but not executable — reinstall below */ }
+    }
+  } catch (e) { /* fall through to install */ }
+  const started = Date.now();
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ntfy-install-"));
+  try {
+    log("local ntfy: ./ntfy missing — downloading v2.36.0");
+    const res = await fetch(NTFY_RELEASE_URL, { signal: AbortSignal.timeout(45000) });
+    if (!res.ok) throw new Error("download HTTP " + res.status);
+    const buf = Buffer.from(await res.arrayBuffer());
+    fs.writeFileSync(path.join(tmpDir, "ntfy.tar.gz"), buf);
+    const hash = crypto.createHash("sha256").update(buf).digest("hex");
+    if (hash !== NTFY_RELEASE_SHA256) throw new Error("SHA256 mismatch (got " + hash.slice(0, 16) + "…)");
+    log("local ntfy: tarball verified (" + buf.length + " bytes, SHA256 OK)");
+    await execFileAsync("tar", ["-xzf", path.join(tmpDir, "ntfy.tar.gz"), "-C", tmpDir, NTFY_RELEASE_MEMBER], { timeout: 15000 });
+    const extracted = path.join(tmpDir, NTFY_RELEASE_MEMBER);
+    fs.copyFileSync(extracted, bin);
+    fs.chmodSync(bin, 0o755);
+    log("local ntfy: binary installed at " + bin + " in " + ((Date.now() - started) / 1000).toFixed(1) + "s");
+    return true;
+  } catch (e) {
+    log("local ntfy: self-install failed (" + String((e && e.message) || e).slice(0, 120) + ") — ntfy publishes fall back to ntfy.sh");
+    return false;
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) { /* best-effort cleanup */ }
+  }
 }
 
 // ---- local ntfy HTTP proxy (v2.13) ----
@@ -703,24 +764,36 @@ async function main() {
   // in /health so the Worker console can see it without another call.
   let lastNtfy = null;
 
-  // ---- local ntfy server (v2.13, subprocess) ----
-  // The ntfy binary (downloaded at Render build time, ./ntfy) runs as
-  // a child process listening on 127.0.0.1:2586 with the committed
-  // ntfy-server.yml config; base-url is filled in at startup from
-  // RENDER_EXTERNAL_URL (fallback: the known public URL) so it can
-  // never go stale. Started here, before connect(), so alarms work
-  // from the first signal. On crash it restarts with a 5s backoff,
-  // max 5 restarts, then gives up (status "down") — publishes still
-  // fall back to ntfy.sh via sendNtfyAlarm. If the binary is missing
-  // (e.g. an older deploy), the bot keeps working for WhatsApp and
-  // every publish goes to ntfy.sh.
+  // ---- local ntfy server (v2.13, subprocess; self-install in v2.13.2) ----
+  // The ntfy binary runs as a child process listening on 127.0.0.1:2586
+  // with the committed ntfy-server.yml config; base-url is filled in at
+  // startup from RENDER_EXTERNAL_URL (fallback: the known public URL)
+  // so it can never go stale. Started here, before connect(), so alarms
+  // work from the first signal. v2.13.2: if ./ntfy is missing, the bot
+  // installs it itself first (ensureNtfyBinary — download + SHA256 +
+  // extract, best-effort, ~60s max), because Render ignores the
+  // render.yaml build/start commands that used to install it. On crash
+  // it restarts with a 5s backoff, max 5 restarts, then gives up
+  // (status "down") — publishes still fall back to ntfy.sh via
+  // sendNtfyAlarm. If the binary is missing AND the self-install fails,
+  // the bot keeps working for WhatsApp and every publish goes to
+  // ntfy.sh.
   const NTFY_MAX_RESTARTS = 5;
   const NTFY_RESTART_BACKOFF_MS = 5000;
   let ntfyServerStatus = "not_installed"; // "running" | "down" | "not_installed"
   let ntfyProc = null;
   let ntfyRestarts = 0;
-  function startLocalNtfy() {
+  // Async: installs the binary first when missing (best-effort, ~60s
+  // max). Called fire-and-forget from main() — a slow download must
+  // never delay the health server binding or the WhatsApp connect;
+  // /health flips ntfy_server to "running" once install + spawn
+  // complete. The restart path reuses it (binary exists by then, so
+  // the install is a no-op).
+  async function startLocalNtfy() {
     const bin = path.join(__dirname, "ntfy");
+    if (!fs.existsSync(bin)) {
+      await ensureNtfyBinary(__dirname);
+    }
     if (!fs.existsSync(bin)) {
       ntfyServerStatus = "not_installed";
       log("local ntfy: ./ntfy binary not installed — ntfy publishes fall back to ntfy.sh");
@@ -831,7 +904,7 @@ async function main() {
   const server = http.createServer((req, res) => {
     if (req.url === "/health" || req.url === "/") {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, bot: "spare-whatsapp-bot", version: "2.13.1", connected, paused, state: paused ? "paused" : (connected ? "linked" : currentStatus), sent_today: sentToday, last_ntfy: lastNtfy, ntfy_server: ntfyServerStatus, ntfy_exists: fs.existsSync(path.join(__dirname, "ntfy")), ntfy_path: path.join(__dirname, "ntfy"), cwd: process.cwd(), ts: Date.now() }));
+      res.end(JSON.stringify({ ok: true, bot: "spare-whatsapp-bot", version: "2.13.2", connected, paused, state: paused ? "paused" : (connected ? "linked" : currentStatus), sent_today: sentToday, last_ntfy: lastNtfy, ntfy_server: ntfyServerStatus, ntfy_exists: fs.existsSync(path.join(__dirname, "ntfy")), ntfy_path: path.join(__dirname, "ntfy"), cwd: process.cwd(), ts: Date.now() }));
     } else if (req.url === "/signal" && req.method === "POST") {
       handlePushSignal(req, res);
     } else if (req.url === "/ntfy-test" && req.method === "POST") {
@@ -1281,4 +1354,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { stripLinks, assertQueuedJid, isValidSignalItem, formatDelay, applyDelayToken, sendNtfyAlarm, sanitizeNtfyTitle, isValidNtfyTopic, resolveNtfyBase, proxyToLocalNtfy, toStorable, fromStorable, readCount, isRecentlySent, markSent, ownNumberDigits, isValidBotCommand, fetchBotCommand, ackBotCommand, MAIN_NUMBER };
+module.exports = { stripLinks, assertQueuedJid, isValidSignalItem, formatDelay, applyDelayToken, sendNtfyAlarm, sanitizeNtfyTitle, isValidNtfyTopic, resolveNtfyBase, ensureNtfyBinary, NTFY_RELEASE_URL, NTFY_RELEASE_SHA256, NTFY_RELEASE_MEMBER, proxyToLocalNtfy, toStorable, fromStorable, readCount, isRecentlySent, markSent, ownNumberDigits, isValidBotCommand, fetchBotCommand, ackBotCommand, MAIN_NUMBER };
