@@ -3,9 +3,11 @@
 A Baileys (WhatsApp Web multi-device) bot that links as a companion device
 to the **spare WhatsApp +923703832506** and sends plain-text trade alerts
 to the recipients the dogar-alerts Worker queues (default: the main number
-**+923001412943** only — pre-added, never needs to be added by hand). It
-polls the Worker queue — the Worker never pushes to the bot, so no public
-IP or port forwarding is needed.
+**+923001412943** only — pre-added, never needs to be added by hand). Fast
+path is PUSH: the Worker POSTs each queued signal straight to this bot
+(`POST /signal`), so WhatsApp delivery is ~1-2s. The queue poll below is
+the fallback — no public IP or port forwarding is needed (Render gives
+the bot a public URL and the Worker calls it).
 
 ## Host: Render (free) — primary; Termux — fallback
 
@@ -23,11 +25,28 @@ IP or port forwarding is needed.
 - `render.yaml` — Render Blueprint (free web service, `/health` check)
 - `run-bot.sh` — Termux starter (reads the token from `.spare-token`)
 
-## How alerts flow
+## How alerts flow (v2.6 — push, poll as fallback)
 
 TradingView alert -> dogar-alerts Worker -> Discord (unchanged) + KV queue
-(`wa`) -> this bot polls `/spare-pending?queue=wa` every 10s -> WhatsApp
-message to each queued recipient -> bot acks the item.
+(`wa`) -> **Worker PUSHES the queued item to this bot (`POST /signal`,
+SPARE_TOKEN, 5s timeout) -> WhatsApp message to each queued recipient
+in ~1-2s** -> bot acks the item so the poll skips it.
+
+Fallback: the bot ALSO polls `/spare-pending?queue=wa` every `POLL_SECONDS`
+(5s on Render) — a push that fails, a signal queued while the bot is
+down, or a push held while the bot is paused still arrives on the next
+poll (~5s). The push and the poll send through the SAME function, so
+validation, the 30/day cap, the 1-hour dedup and the 3s gap behave
+identically on both paths — a pushed duplicate of an already-sent queue
+id is never sent twice. The push handler answers AFTER the send, so the
+Worker measures the true delivery time from the round trip.
+
+Measured delay (live, after the v2.6 Render deploy): _pending — fill in
+from the first TEST webhook after deploy_ (target: webhook POST to
+WhatsApp send ≤ 3s). Fallback poll at 5s costs ~2 Worker requests per
+poll cycle (queue + command check) ≈ 35k requests/day and ≈ 35k KV
+reads/day — inside the 100k/day free budget for both. Do NOT poll faster
+than 5s: the gain is under a second and the KV read budget halves.
 
 SINGLE-ALERT RULE (2026-11-11): only ONE alert per signal is ever queued —
 the entry confirmation ("🟢/🔴 BUY/SELL SIGNAL - Detected", with SL, TP,
@@ -91,11 +110,13 @@ Linked Devices -> remove it (then the bot will clear KV auth and stop).
 ## Test
 
 - `npm run self-test` — unit test: link stripping, recipient guard,
-  KV auth serialization round-trip, dedup.
+  KV auth serialization round-trip, dedup, bot commands, pushed-signal
+  shape (`isValidSignalItem`).
 - `npm run dry-run` — poll the live queue and log what WOULD be sent
   (sends nothing, acks nothing). Needs `SPARE_TOKEN` in env.
 - Live test (after linking): press TEST in the control panel; the spare
-  WhatsApp must deliver it to the main number within ~15s.
+  WhatsApp must deliver it to the main number within ~3s (push path;
+  ~5s worst case on the poll fallback).
 
 ## Logs / troubleshooting
 
@@ -132,6 +153,6 @@ controls — all from the panel, no Render login needed:
 
 How it works: the panel writes a command to the Worker's KV command
 channel (`POST /panel/api/bot-command`); the bot checks for a pending
-command on every 10-second poll (`GET /spare-command`) and acks it
+command on every poll (`GET /spare-command`, every 5s on Render) and acks it
 (`POST /spare-command {ack, result}`) after executing. In `DRY_RUN`
 commands are only simulated (acked, no state change).

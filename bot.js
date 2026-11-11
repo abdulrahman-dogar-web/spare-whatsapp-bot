@@ -4,8 +4,12 @@
  * Links as a companion device to the SPARE WhatsApp account (+923703832506)
  * and sends plain-text alert messages to the recipients the Worker queues
  * (default: the main number +923001412943 only).
- * It polls the dogar-alerts Worker queue (Cloudflare KV) — the Worker never
- * pushes to the phone, so no public IP / port forwarding is needed.
+ * Delivery (v2.6): the Worker PUSHES each queued signal straight to this
+ * bot (POST /signal) so it sends in ~1-2s; the bot ALSO polls the Worker
+ * queue (Cloudflare KV) every POLL_SECONDS as the fallback — a push that
+ * fails, or a signal queued while the bot is down, still arrives on the
+ * next poll. No public IP / port forwarding is needed (Render gives the
+ * bot a public URL and the Worker calls it).
  *
  * HOST: Render free web service (primary). Termux on the spare phone is the
  * fallback (see ../spare-call/SETUP-TERMUX.md).
@@ -29,7 +33,7 @@
  *
  * BOT TAB COMMANDS (v2.2 + v2.5): the panel's Bot tab sends commands
  * through a KV command channel on the Worker (GET/POST /spare-command,
- * same token). The bot checks for a pending command on every 10s poll
+ * same token). The bot checks for a pending command on every poll
  * and acks it after executing: RECONNECT closes the socket and
  * reconnects at once (session kept — no re-link); RESTART exits so
  * Render restarts the service; STOP pauses sending (alerts stay queued)
@@ -43,7 +47,8 @@
  * Env:
  *   WORKER_URL    default https://dogar-alerts.abdulrahman-dogar.workers.dev
  *   SPARE_TOKEN   required — the SPARE_BOT_TOKEN Worker secret
- *   POLL_SECONDS  default 10
+ *   POLL_SECONDS  default 10 (Render sets 5 — fallback poll only; the
+ *                 push path is what makes delivery fast)
  *   LINK_MODE     qr | code   (default qr)
  *   SPARE_PHONE   digits-only number of the spare WhatsApp account
  *                 (default 923703832506) — used ONLY for the pairing code
@@ -137,6 +142,18 @@ function assertQueuedJid(number) {
     throw new Error("refusing to send to invalid recipient: " + String(number).slice(0, 30));
   }
   return digits + "@s.whatsapp.net";
+}
+
+// Pushed-signal shape (v2.6): the Worker POSTs the queued item itself to
+// /signal — {id, kind, text, to} plus the SPARE_TOKEN. The token is
+// checked separately (401), so this only validates the item shape.
+// Exported for the self-test.
+function isValidSignalItem(item) {
+  return !!item && typeof item === "object" &&
+    typeof item.id === "string" && item.id.length > 0 &&
+    typeof item.text === "string" && item.text.length > 0 &&
+    (item.to === undefined || typeof item.to === "string") &&
+    (item.kind === undefined || typeof item.kind === "string");
 }
 
 // ---- Baileys auth in Cloudflare KV (via the Worker /spare-auth) ----
@@ -453,16 +470,81 @@ async function main() {
 
   // /health server — Render requires the service to bind $PORT, and the
   // Worker's cron keep-alive pings this endpoint every 5 minutes.
+  // POST /signal (v2.6 PUSH): the Worker pushes a queued signal straight
+  // here (auth: SPARE_TOKEN, same scheme as the /spare-* endpoints) so it
+  // sends in ~1-2s instead of waiting for the poll. The pushed item is the
+  // same shape as a queue item ({id, kind, text, to}); it goes through
+  // the SAME send path as the poll loop (validation, caps, dedup, 3s
+  // gap) — a pushed duplicate of an already-sent queue id is never sent
+  // twice. On success the item is acked so the poll loop skips it.
+  // The handler awaits the send, so the Worker measures the true
+  // delivery time from the round trip.
   const server = http.createServer((req, res) => {
     if (req.url === "/health" || req.url === "/") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, bot: "spare-whatsapp-bot", connected, paused, state: paused ? "paused" : (connected ? "linked" : currentStatus), sent_today: sentToday, ts: Date.now() }));
+    } else if (req.url === "/signal" && req.method === "POST") {
+      handlePushSignal(req, res);
     } else {
       res.writeHead(404);
       res.end("not found");
     }
   });
   server.listen(PORT, "0.0.0.0", () => log("health server on :" + PORT));
+
+  // POST /signal handler (v2.6). A pushed item that fails validation
+  // gets 400, a bad token 401. A "retry" outcome (not connected, cap
+  // reached, send failed) still answers 200 — the item stays queued and
+  // the poll loop delivers it, so the push is never a single point of
+  // failure. A paused bot holds the push (200, "paused_held") and the
+  // queue delivers it on resume.
+  async function handlePushSignal(req, res) {
+    const started = Date.now();
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 10000) req.destroy();
+    });
+    req.on("end", async () => {
+      let item = null;
+      try { item = JSON.parse(body || "{}"); } catch (e) { item = null; }
+      if (!isValidSignalItem(item)) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "bad_payload" }));
+        return;
+      }
+      if (String(item.token || "") !== SPARE_TOKEN) {
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "bad_token" }));
+        return;
+      }
+      if (paused) {
+        log(`push ${item.id} held — bot paused (stays queued)`);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, result: "paused_held", ms: Date.now() - started }));
+        return;
+      }
+      const r = await sendQueuedItemLocked(item);
+      const ms = Date.now() - started;
+      if (r.action === "sent" || r.action === "drop") {
+        // Sent (or a duplicate/invalid item that must not retry): ack it
+        // so the poll loop never sends it again. If the ack itself fails,
+        // the 1h dedup still stops a double send.
+        if (!DRY_RUN) {
+          try { await ackItems([item.id]); } catch (e) { /* dedup covers it */ }
+        }
+        log(`push ${item.id} ${r.action} in ${ms}ms`);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, result: r.action, ms }));
+      } else if (r.action === "dryrun") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, result: "dryrun", ms }));
+      } else {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, result: "retry_" + r.reason, ms }));
+      }
+    });
+  }
 
   function connect() {
     sock = makeWASocket({
@@ -642,6 +724,70 @@ async function main() {
     }
   }
 
+  // Shared send path (v2.6): the poll loop AND the push endpoint
+  // (POST /signal) send through this one function, so validation, caps,
+  // dedup, the 3s gap and the daily cap behave identically on both
+  // paths. Returns {action, reason}:
+  //   "sent"   — message went out (caller must ack the id)
+  //   "drop"   — ack it (empty text / invalid recipient / already sent)
+  //   "retry"  — leave queued (not connected / cap reached / send failed)
+  //   "dryrun" — logged only, never acked (DRY_RUN mode)
+  let lastSendAt = 0;
+  async function sendQueuedItem(item) {
+    const text = stripLinks(item.text || "");
+    if (!text) return { action: "drop", reason: "empty text" };
+    if (isRecentlySent(item.id)) {
+      // KV can briefly re-list an acked item; never send it twice.
+      log(`skip duplicate ${item.id} (already sent, still listed)`);
+      return { action: "drop", reason: "duplicate" };
+    }
+    if (sentToday >= DAILY_CAP) {
+      log(`daily cap (${DAILY_CAP}) reached — leaving rest queued`);
+      return { action: "retry", reason: "daily cap reached" };
+    }
+    // Recipient comes from the queue item (admin-set in the panel);
+    // default is the main number. Anything else is refused.
+    let jid;
+    try {
+      jid = assertQueuedJid(item.to || MAIN_NUMBER);
+    } catch (e) {
+      log(`refusing item ${item.id}: ${String((e && e.message) || e).slice(0, 100)}`);
+      return { action: "drop", reason: "invalid recipient" };
+    }
+    if (DRY_RUN) {
+      log(`[DRY-RUN] would send to ${jid}: ${text.slice(0, 120)}`);
+      return { action: "dryrun", reason: "dry-run" };
+    }
+    if (!connected || !sock) {
+      log("WhatsApp not connected — items stay queued");
+      return { action: "retry", reason: "not connected" };
+    }
+    // >= 3s between sends, whichever path sends (anti-spam guard).
+    const wait = SEND_GAP_MS - (Date.now() - lastSendAt);
+    if (wait > 0) await sleep(wait);
+    try {
+      await sock.sendMessage(jid, { text });
+      lastSendAt = Date.now();
+      sentToday++;
+      writeCount(sentToday);
+      markSent(item.id);
+      log(`sent to ${jid} (${item.kind}): ${text.slice(0, 120)}`);
+      return { action: "sent", reason: "sent to " + jid };
+    } catch (e) {
+      log("send failed, will retry next poll: " + String((e && e.message) || e).slice(0, 120));
+      return { action: "retry", reason: "send failed: " + String((e && e.message) || e).slice(0, 80) };
+    }
+  }
+
+  // Serialize sends: a push arriving mid-poll must not send less than 3s
+  // after the poll's last send (and vice versa).
+  let sendChain = Promise.resolve();
+  function sendQueuedItemLocked(item) {
+    const run = sendChain.then(() => sendQueuedItem(item));
+    sendChain = run.catch(() => {});
+    return run;
+  }
+
   // Poll loop — runs even while WhatsApp is down; items stay queued until sent.
   let polling = false;
   setInterval(async () => {
@@ -657,51 +803,10 @@ async function main() {
       log(`queue: ${items.length} pending`);
       const acked = [];
       for (const item of items) {
-        const text = stripLinks(item.text || "");
-        if (!text) {
-          acked.push(item.id); // empty text: drop it, nothing to send
-          continue;
-        }
-        if (isRecentlySent(item.id)) {
-          // KV can briefly re-list an acked item; never send it twice.
-          log(`skip duplicate ${item.id} (already sent, still listed)`);
-          acked.push(item.id);
-          continue;
-        }
-        if (sentToday >= DAILY_CAP) {
-          log(`daily cap (${DAILY_CAP}) reached — leaving rest queued`);
-          break;
-        }
-        // Recipient comes from the queue item (admin-set in the panel);
-        // default is the main number. Anything else is refused.
-        let jid;
-        try {
-          jid = assertQueuedJid(item.to || MAIN_NUMBER);
-        } catch (e) {
-          log(`refusing item ${item.id}: ${String((e && e.message) || e).slice(0, 100)}`);
-          acked.push(item.id); // invalid recipient: drop it, never retry
-          continue;
-        }
-        if (DRY_RUN) {
-          log(`[DRY-RUN] would send to ${jid}: ${text.slice(0, 120)}`);
-          continue; // dry-run never acks: items stay queued for the real run
-        }
-        if (!connected || !sock) {
-          log("WhatsApp not connected — items stay queued");
-          break;
-        }
-        try {
-          await sock.sendMessage(jid, { text });
-          sentToday++;
-          writeCount(sentToday);
-          markSent(item.id);
-          acked.push(item.id);
-          log(`sent to ${jid} (${item.kind}): ${text.slice(0, 120)}`);
-        } catch (e) {
-          log("send failed, will retry next poll: " + String((e && e.message) || e).slice(0, 120));
-          break;
-        }
-        await sleep(SEND_GAP_MS);
+        const r = await sendQueuedItemLocked(item);
+        if (r.action === "sent" || r.action === "drop") acked.push(item.id);
+        else if (r.action === "retry") break;
+        // dryrun: continue without acking (items stay queued for the real run)
       }
       if (acked.length > 0 && !DRY_RUN) {
         const res = await ackItems(acked);
@@ -736,4 +841,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { stripLinks, assertQueuedJid, toStorable, fromStorable, readCount, isRecentlySent, markSent, ownNumberDigits, isValidBotCommand, fetchBotCommand, ackBotCommand, MAIN_NUMBER };
+module.exports = { stripLinks, assertQueuedJid, isValidSignalItem, toStorable, fromStorable, readCount, isRecentlySent, markSent, ownNumberDigits, isValidBotCommand, fetchBotCommand, ackBotCommand, MAIN_NUMBER };
