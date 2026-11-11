@@ -18,6 +18,21 @@
  * stands. A per-item dry_run flag lets the Worker verify image handling
  * without sending anything (token-authenticated; the Worker never sets
  * dry_run in production).
+ * ntfy alarm (v2.11): the BOT — not the Worker — publishes the ntfy
+ * phone alarm. Cloudflare Workers share a small pool of egress IPs
+ * with thousands of other users, so ntfy.sh's per-IP quota (250
+ * msgs/day) is exhausted by strangers and even a first-ever post gets
+ * HTTP 429 (seen 2026-11-11 on the panel Test alarm button). The
+ * Render bot's IP is far less crowded. The Worker attaches an ntfy
+ * block {topic, enabled, title} to the FIRST recipient's item only —
+ * three recipients still mean ONE alarm, not three — and the bot POSTs
+ * to ntfy.sh/<topic> with Priority: 5 right after the WhatsApp send
+ * succeeds (never before, never delaying it). POST /ntfy-test is the
+ * panel "Test alarm" button's endpoint (same SPARE_TOKEN auth).
+ * A dry-run item that explicitly carries an ntfy block also posts —
+ * production never attaches ntfy to dry-run items, so this is the
+ * verification hook only (proves the bot's egress IP reaches ntfy.sh
+ * without ringing any phone).
  *
  * HOST: Render free web service (primary). Termux on the spare phone is the
  * fallback (see ../spare-call/SETUP-TERMUX.md).
@@ -189,6 +204,33 @@ function applyDelayToken(text, receivedAt, nowMs) {
   if (d === "—") return t;
   if (t.includes("<delay>")) return t.replace(/<delay>/g, d);
   return t + "\n⚡ Delivered in " + d;
+}
+
+// ---- ntfy.sh alarm (v2.11) ----
+// The bot — not the Worker — publishes the alarm (see header). POST
+// https://ntfy.sh/<topic> with Priority: 5 (max): Android plays a
+// continuous alarm and bypasses silent/DND. Pure helper (exported for
+// the self-test). timeoutMs caps the wait (3s on the signal path so a
+// slow ntfy.sh can never eat the Worker's 5s push budget; 5s for the
+// test endpoint, where the user is waiting for the result).
+function isValidNtfyTopic(topic) {
+  return typeof topic === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(topic);
+}
+async function sendNtfyAlarm(topic, title, text, timeoutMs) {
+  const t = String(topic || "").trim();
+  if (!t) return "ntfy_no_topic";
+  if (!isValidNtfyTopic(t)) return "ntfy_bad_topic";
+  try {
+    const res = await fetch("https://ntfy.sh/" + encodeURIComponent(t), {
+      method: "POST",
+      headers: { "Priority": "5", "Title": String(title || "Signal").slice(0, 100), "Content-Type": "text/plain; charset=utf-8" },
+      body: String(text || "").slice(0, 4000),
+      signal: AbortSignal.timeout(Number(timeoutMs) > 0 ? Number(timeoutMs) : 5000),
+    });
+    return "ntfy_http_" + res.status;
+  } catch (e) {
+    return "ntfy_error_" + String((e && e.message) || e).slice(0, 60);
+  }
 }
 
 // ---- Baileys auth in Cloudflare KV (via the Worker /spare-auth) ----
@@ -479,6 +521,26 @@ async function main() {
   // Panel link/status state (v2.1): last QR + code posted, last status posted.
   let lastLink = { qrDataUrl: null, code: null };
   let currentStatus = "connecting";
+  // ntfy alarm (v2.11): last publish result {result, topic, ts} — shown
+  // in /health so the Worker console can see it without another call.
+  let lastNtfy = null;
+
+  // ntfy alarm (v2.11): post the alarm for an item that carries an ntfy
+  // block {topic, enabled, title}. Called AFTER the WhatsApp send
+  // succeeds (or for a dry-run verification item) — it never delays a
+  // send. Returns the result string ("ntfy_http_200", "ntfy_http_429",
+  // ...), or null when the item carries no ntfy block / it is disabled
+  // / the topic is empty. Records the result in lastNtfy.
+  async function maybePostNtfy(item, text) {
+    const n = item && item.ntfy;
+    if (!n || typeof n !== "object" || n.enabled === false) return null;
+    const topic = String(n.topic || "").trim();
+    if (!topic) return null;
+    const result = await sendNtfyAlarm(topic, String(n.title || "Signal").slice(0, 100), text, 3000);
+    lastNtfy = { result, topic, ts: Date.now() };
+    log(`ntfy alarm — ${result} (topic ${topic})`);
+    return result;
+  }
 
   // Request a fresh pairing code (v2.5): posted to /spare-link ALONGSIDE
   // the QR. `force` (panel "Get a fresh code") bypasses the 60s throttle
@@ -517,15 +579,61 @@ async function main() {
   const server = http.createServer((req, res) => {
     if (req.url === "/health" || req.url === "/") {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, bot: "spare-whatsapp-bot", connected, paused, state: paused ? "paused" : (connected ? "linked" : currentStatus), sent_today: sentToday, ts: Date.now() }));
+      res.end(JSON.stringify({ ok: true, bot: "spare-whatsapp-bot", connected, paused, state: paused ? "paused" : (connected ? "linked" : currentStatus), sent_today: sentToday, last_ntfy: lastNtfy, ts: Date.now() }));
     } else if (req.url === "/signal" && req.method === "POST") {
       handlePushSignal(req, res);
+    } else if (req.url === "/ntfy-test" && req.method === "POST") {
+      handleNtfyTest(req, res);
     } else {
       res.writeHead(404);
       res.end("not found");
     }
   });
   server.listen(PORT, "0.0.0.0", () => log("health server on :" + PORT));
+
+  // POST /ntfy-test (v2.11): the Worker's panel "Test alarm" button
+  // asks the BOT to post the test message (auth: SPARE_TOKEN, same as
+  // /signal). Body {token, topic, title, body}. Returns
+  // {ok:true, result:"ntfy_http_200", topic} on success. Only the
+  // Worker calls this (via the panel button the user presses himself);
+  // the button is rate-limited to 1/min Worker-side.
+  async function handleNtfyTest(req, res) {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 10000) req.destroy();
+    });
+    req.on("end", async () => {
+      let b = null;
+      try { b = JSON.parse(body || "{}"); } catch (e) { b = null; }
+      if (!b || typeof b !== "object") {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "bad_payload" }));
+        return;
+      }
+      if (String(b.token || "") !== SPARE_TOKEN) {
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "bad_token" }));
+        return;
+      }
+      const topic = String(b.topic || "").trim();
+      if (!isValidNtfyTopic(topic)) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "bad_topic" }));
+        return;
+      }
+      const result = await sendNtfyAlarm(topic, String(b.title || "Test alarm — Dogar Alerts").slice(0, 100), String(b.body || ""), 5000);
+      lastNtfy = { result, topic, ts: Date.now() };
+      log(`ntfy test — ${result} (topic ${topic})`);
+      if (/^ntfy_http_2/.test(result)) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, result, topic }));
+      } else {
+        res.writeHead(502, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: result, topic }));
+      }
+    });
+  }
 
   // POST /signal handler (v2.6). A pushed item that fails validation
   // gets 400, a bad token 401. A "retry" outcome (not connected, cap
@@ -570,12 +678,13 @@ async function main() {
         }
         log(`push ${item.id} ${r.action} in ${ms}ms`);
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true, result: r.action, ms }));
+        res.end(JSON.stringify({ ok: true, result: r.action, ms, ...(r.ntfy ? { ntfy: r.ntfy } : {}) }));
       } else if (r.action === "dryrun") {
         res.writeHead(200, { "content-type": "application/json" });
         // v2.10: the per-item dry run reports the decoded image size, so
         // the Worker can verify image handling without sending anything.
-        res.end(JSON.stringify({ ok: true, result: "dryrun", ms, ...(typeof r.imageBytes === "number" ? { imageBytes: r.imageBytes } : {}) }));
+        // v2.11: ...plus the ntfy result when the item carried an ntfy block.
+        res.end(JSON.stringify({ ok: true, result: "dryrun", ms, ...(typeof r.imageBytes === "number" ? { imageBytes: r.imageBytes } : {}), ...(r.ntfy ? { ntfy: r.ntfy } : {}) }));
       } else {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true, result: "retry_" + r.reason, ms }));
@@ -797,7 +906,13 @@ async function main() {
     // sets dry_run in production.
     if (item.dry_run === true) {
       log(`[DRY-RUN-ITEM] would send ${imageBuf ? "image (" + imageBuf.length + " bytes, " + (item.image.mime || "?") + ")" : "text"} to ${item.to || MAIN_NUMBER}: ${text.slice(0, 120)}`);
-      return { action: "dryrun", reason: "dry-run-item", imageBytes: imageBuf ? imageBuf.length : 0 };
+      // ntfy verification hook (v2.11): a dry-run item NEVER sends
+      // WhatsApp, but if it explicitly carries an ntfy block, post the
+      // alarm — production never attaches ntfy to dry-run items, so this
+      // only ever fires for an injected verification item (proves the
+      // bot's egress IP reaches ntfy.sh without ringing any phone).
+      const ntfyDry = await maybePostNtfy(item, text);
+      return { action: "dryrun", reason: "dry-run-item", imageBytes: imageBuf ? imageBuf.length : 0, ...(ntfyDry ? { ntfy: ntfyDry } : {}) };
     }
     if (sentToday >= DAILY_CAP) {
       log(`daily cap (${DAILY_CAP}) reached — leaving rest queued`);
@@ -835,7 +950,11 @@ async function main() {
       writeCount(sentToday);
       markSent(item.id);
       log(`sent to ${jid} (${item.kind}): ${imageBuf ? "image (" + imageBuf.length + " bytes)" : text.slice(0, 120)}`);
-      return { action: "sent", reason: "sent to " + jid };
+      // ntfy alarm (v2.11): AFTER the WhatsApp send, once per signal —
+      // the Worker attaches the ntfy block to the FIRST recipient's item
+      // only, so three recipients still mean one alarm, not three.
+      const ntfy = await maybePostNtfy(item, text);
+      return { action: "sent", reason: "sent to " + jid, ...(ntfy ? { ntfy } : {}) };
     } catch (e) {
       log("send failed, will retry next poll: " + String((e && e.message) || e).slice(0, 120));
       return { action: "retry", reason: "send failed: " + String((e && e.message) || e).slice(0, 80) };
@@ -904,4 +1023,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { stripLinks, assertQueuedJid, isValidSignalItem, formatDelay, applyDelayToken, toStorable, fromStorable, readCount, isRecentlySent, markSent, ownNumberDigits, isValidBotCommand, fetchBotCommand, ackBotCommand, MAIN_NUMBER };
+module.exports = { stripLinks, assertQueuedJid, isValidSignalItem, formatDelay, applyDelayToken, sendNtfyAlarm, isValidNtfyTopic, toStorable, fromStorable, readCount, isRecentlySent, markSent, ownNumberDigits, isValidBotCommand, fetchBotCommand, ackBotCommand, MAIN_NUMBER };
